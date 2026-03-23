@@ -4,10 +4,10 @@ const axios = require("axios");
 const Anthropic = require("@anthropic-ai/sdk");
 
 const app = express();
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
 const conversations = new Map();
 
 const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant personnel IA d'Alexis San Jose, entrepreneur e-commerce basé en Gironde, France. Tu gères tout son business de A à Z. Tu es son bras droit opérationnel.
@@ -35,88 +35,53 @@ Boutique Etsy : DodoDogFR
 BOUTIQUE 2 — VERANO LUMIÈRE PARIS (veranolumiereparis.fr)
 ═══════════════════════════════
 Niche : luminaires design, marché français premium
-Catalogue :
-  - Lustres (Moderne, Scandinave, Industriel, Minimaliste, Vintage) en Bois/Métal/Verre/Rotin
-  - Suspensions (Moderne, Scandinave, Minimaliste, Vintage, Industriel) en Bois/Métal/Verre/Rotin
-  - Plafonniers (Moderne, Scandinave, Industriel, Minimaliste, Vintage) en Bois/Métal/Verre/Rotin
-  - Appliques Murales (Moderne, Industriel, Minimaliste, Vintage, Scandinave) en Métal/Verre/Rotin/Bois
-  - Lampadaires (Moderne, Scandinave, Minimaliste, Vintage, Industriel) en Bois/Métal/Rotin/Verre
-  - Lampes de Table (Moderne, Scandinave, Minimaliste, Vintage) en Métal/Rotin
+Catalogue : Lustres, Suspensions, Plafonniers, Appliques Murales, Lampadaires, Lampes de Table
+Styles : Moderne, Scandinave, Industriel, Minimaliste, Vintage
+Matières : Bois, Métal, Verre, Rotin
 Statut : rouvert la semaine dernière, GMC 360 fiches en stock limité en attente de validation
-Produits via DSers (liens fournisseurs perdus lors de la coupure de boutique)
+Produits via DSers (liens fournisseurs perdus lors de la coupure)
 Charte graphique : bronze #A8815C, fond blanc #FFFFFF, dark #1A1A1B, minimaliste luxe
 
 ═══════════════════════════════
 BOUTIQUE 3 — VELLURE
 ═══════════════════════════════
-Statut : en cours de repositionnement sur une nouvelle niche mono mot-clé (à définir)
-Ancienne activité : lampes design sans fil rechargeables
+Statut : repositionnement sur nouvelle niche mono mot-clé à définir
 
 ═══════════════════════════════
 BOUTIQUE 4 — DODOBABY
 ═══════════════════════════════
-Statut : en construction, niveau produits
-Niche : bébé / poussette, marché français
+Statut : en construction, niche bébé/poussette, marché français
 
 ═══════════════════════════════
-OUTILS & STACK TECHNIQUE
+OUTILS
 ═══════════════════════════════
-- Shopify (les 4 boutiques)
-- Google Ads + Google Merchant Center
-- Simprosys (gestion flux produits + custom labels)
-- DSers (dropshipping AliExpress)
-- Nano Banana Pro 2 (génération images IA)
-
-═══════════════════════════════
-PROFIL ALEXIS
-═══════════════════════════════
-- Gère tout seul : technique, marketing, pub, contenu
-- Basé en Gironde, France
-- Débrouillard et autonome techniquement
-- Approche conservative sur les campagnes pub (data first)
-- Préfère les réponses directes et concises
-- Aime avoir le contrôle avant d'exécuter
-- Travaille souvent tard le soir
+Shopify, Google Ads, GMC, Simprosys, DSers, Nano Banana Pro 2
 
 ═══════════════════════════════
 RÈGLES ABSOLUES
 ═══════════════════════════════
 1. Toujours répondre en français
-2. Toujours proposer un plan AVANT d'exécuter
-3. Actions simples → confirmation "oui/non"
-4. Actions risquées (prix en masse, campagnes actives) → double confirmation
-5. Actions lecture seule (stats, analyse) → réponse directe
+2. Toujours proposer avant d'exécuter
+3. Actions simples → confirmation oui/non
+4. Actions risquées → double confirmation
+5. Actions lecture seule → réponse directe
 6. Concis et actionnable, jamais de blabla
 7. Ne jamais redemander des infos déjà connues`;
 
-app.get("/webhook", (req, res) => {
-  const mode = req.query["hub.mode"];
-  const token = req.query["hub.verify_token"];
-  const challenge = req.query["hub.challenge"];
-  if (mode === "subscribe" && token === process.env.VERIFY_TOKEN) {
-    res.status(200).send(challenge);
-  } else {
-    res.sendStatus(403);
-  }
-});
-
 app.post("/webhook", async (req, res) => {
-  res.sendStatus(200);
+  const from = req.body.From;
+  const text = req.body.Body;
+  
+  if (!from || !text) return res.sendStatus(200);
+  
+  console.log(`Message de ${from}: ${text}`);
+
+  if (!conversations.has(from)) conversations.set(from, []);
+  const history = conversations.get(from);
+  history.push({ role: "user", content: text });
+  if (history.length > 20) history.splice(0, history.length - 20);
+
   try {
-    const entry = req.body.entry?.[0];
-    const change = entry?.changes?.[0];
-    const msg = change?.value?.messages?.[0];
-    if (!msg || msg.type !== "text") return;
-
-    const from = msg.from;
-    const text = msg.text.body;
-    console.log(`Message de ${from}: ${text}`);
-
-    if (!conversations.has(from)) conversations.set(from, []);
-    const history = conversations.get(from);
-    history.push({ role: "user", content: text });
-    if (history.length > 20) history.splice(0, history.length - 20);
-
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1024,
@@ -128,22 +93,24 @@ app.post("/webhook", async (req, res) => {
     history.push({ role: "assistant", content: reply });
 
     await axios.post(
-      `https://graph.facebook.com/v19.0/${process.env.PHONE_ID}/messages`,
+      `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
+      new URLSearchParams({
+        From: `whatsapp:${process.env.TWILIO_NUMBER}`,
+        To: from,
+        Body: reply,
+      }),
       {
-        messaging_product: "whatsapp",
-        to: from,
-        type: "text",
-        text: { body: reply },
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.WA_TOKEN}`,
-          "Content-Type": "application/json",
+        auth: {
+          username: process.env.TWILIO_SID,
+          password: process.env.TWILIO_TOKEN,
         },
       }
     );
+
+    res.sendStatus(200);
   } catch (err) {
     console.error("Erreur:", err.message);
+    res.sendStatus(200);
   }
 });
 
