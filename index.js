@@ -29,8 +29,27 @@ function validateTwilioSignature(req) {
 const MODEL_SONNET = "claude-sonnet-4-20250514";
 const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 
+function isUrgent(text) {
+  const t = text.toLowerCase();
+  const urgentTriggers = [
+    "urgent", "urgence", "critique", "problème critique",
+    "c'est grave", "grosse erreur", "tout est cassé",
+    "plus de ventes", "site down", "site planté",
+    "campagne stoppée", "compte suspendu", "banni",
+    "asap", "immédiatement", "au plus vite", "sos"
+  ];
+  return urgentTriggers.some(t2 => t.includes(t2));
+}
+
 function selectModel(text) {
   const t = text.toLowerCase();
+
+  // Urgence → toujours Sonnet
+  if (isUrgent(text)) {
+    console.log(`🚨 Modèle: Sonnet (URGENT)`);
+    return MODEL_SONNET;
+  }
+
   const sonnetTriggers = [
     "analyse", "analyser", "analysons",
     "stratégie", "stratégique",
@@ -49,10 +68,12 @@ function selectModel(text) {
     "email", "mail",
     "pourquoi", "comment se fait"
   ];
+
   if (sonnetTriggers.some(trigger => t.includes(trigger))) {
     console.log(`🧠 Modèle: Sonnet (tâche complexe)`);
     return MODEL_SONNET;
   }
+
   console.log(`⚡ Modèle: Haiku (message simple)`);
   return MODEL_HAIKU;
 }
@@ -211,11 +232,10 @@ Si non: IGNORER`
 async function handleCommand(command) {
   const cmd = command.trim().toLowerCase();
 
-  // /status — résumé de toutes les boutiques
   if (cmd === "/status") {
     const memory = await pool.query(`SELECT key, value, tags FROM memory ORDER BY updated_at DESC`);
     if (memory.rows.length === 0) {
-      return "📊 *Status Jarvis*\n\nAucune donnée en mémoire pour l'instant. Parle-moi de tes boutiques pour que je commence à tout mémoriser.";
+      return "📊 *Status Jarvis*\n\nAucune donnée en mémoire pour l'instant.";
     }
     const byTag = {};
     memory.rows.forEach(r => {
@@ -230,7 +250,6 @@ async function handleCommand(command) {
     return response.trim();
   }
 
-  // /memory — affiche tout ce que Jarvis a en mémoire
   if (cmd === "/memory") {
     const memory = await pool.query(`SELECT key, value, tags, updated_at FROM memory ORDER BY updated_at DESC LIMIT 30`);
     if (memory.rows.length === 0) return "🧠 *Mémoire vide*\n\nJe n'ai encore rien mémorisé.";
@@ -242,18 +261,16 @@ async function handleCommand(command) {
     return response.trim();
   }
 
-  // /clear — remet l'historique de conversation à zéro
   if (cmd === "/clear") {
     await pool.query(`DELETE FROM conversations WHERE user_phone = $1`, [ALLOWED_NUMBER]);
     return "🗑️ Historique de conversation effacé. On repart de zéro !";
   }
 
-  // /help — liste des commandes
   if (cmd === "/help") {
-    return `🤖 *Commandes Jarvis*\n\n/status — résumé de toutes tes boutiques\n/memory — tout ce que j'ai en mémoire\n/clear — efface l'historique de conversation\n/help — cette aide\n\nTu peux aussi m'envoyer des photos pour que je les analyse !`;
+    return `🤖 *Commandes Jarvis*\n\n/status — résumé de toutes tes boutiques\n/memory — tout ce que j'ai en mémoire\n/clear — efface l'historique de conversation\n/help — cette aide\n\nTu peux aussi m'envoyer des 📸 photos pour que je les analyse !`;
   }
 
-  return null; // Pas une commande reconnue
+  return null;
 }
 
 // ═══════════════════════════════
@@ -268,12 +285,11 @@ async function handleImageMessage(req, history, systemWithMemory) {
   const caption = req.body.Body || "";
 
   if (!mediaType?.startsWith("image/")) {
-    return "Je ne peux traiter que des images pour l'instant (pas de vidéo ni de document).";
+    return "Je ne peux traiter que des images pour l'instant.";
   }
 
-  console.log(`🖼️ Image reçue: ${mediaType} — ${mediaUrl}`);
+  console.log(`🖼️ Image reçue: ${mediaType}`);
 
-  // Télécharge l'image et la convertit en base64
   const imageResponse = await axios.get(mediaUrl, {
     responseType: "arraybuffer",
     auth: {
@@ -283,19 +299,13 @@ async function handleImageMessage(req, history, systemWithMemory) {
   });
 
   const base64Image = Buffer.from(imageResponse.data).toString("base64");
-  const mimeType = mediaType;
 
-  // Construit le message avec l'image
   const userMessage = {
     role: "user",
     content: [
       {
         type: "image",
-        source: {
-          type: "base64",
-          media_type: mimeType,
-          data: base64Image,
-        },
+        source: { type: "base64", media_type: mediaType, data: base64Image },
       },
       {
         type: "text",
@@ -304,13 +314,11 @@ async function handleImageMessage(req, history, systemWithMemory) {
     ],
   };
 
-  const messagesWithImage = [...history, userMessage];
-
   const response = await anthropic.messages.create({
-    model: MODEL_SONNET, // Toujours Sonnet pour les images
+    model: MODEL_SONNET,
     max_tokens: 1024,
     system: systemWithMemory,
-    messages: messagesWithImage,
+    messages: [...history, userMessage],
   });
 
   console.log(`🧠 Modèle: Sonnet (analyse image)`);
@@ -341,6 +349,16 @@ async function sendWhatsApp(to, body) {
 // SYSTEM PROMPT
 // ═══════════════════════════════
 const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant personnel IA d'Alexis San Jose, entrepreneur e-commerce basé en Gironde, France. Tu gères tout son business de A à Z. Tu es son bras droit opérationnel.
+
+═══════════════════════════════
+FORMATAGE WHATSAPP — RÈGLES OBLIGATOIRES
+═══════════════════════════════
+- Titres et mots importants : *texte en gras*
+- Sous-titres ou emphase : _texte en italique_
+- Listes : commence chaque item par • ou un chiffre
+- Séparations : utilise des lignes vides entre les sections
+- Émojis : utilise-les avec parcimonie pour structurer (✅ ⚠️ 📊 💡 🚨)
+- Jamais de markdown classique (# ## **) — uniquement le formatage WhatsApp natif
 
 ═══════════════════════════════
 BOUTIQUE 1 — DODODOG (dododog.fr)
@@ -395,7 +413,8 @@ RÈGLES ABSOLUES
 6. Concis et actionnable, jamais de blabla
 7. Ne jamais redemander des infos déjà connues
 8. Tu as une mémoire persistante — utilise-la pour t'améliorer continuellement
-9. Si tu apprends quelque chose d'important sur Alexis ou son business, mémorise-le`;
+9. Si tu apprends quelque chose d'important sur Alexis ou son business, mémorise-le
+10. En cas d'urgence détectée, réponds en priorité absolue avec 🚨 en début de message`;
 
 // ═══════════════════════════════
 // WEBHOOK
@@ -406,7 +425,6 @@ app.post("/webhook", async (req, res) => {
   const messageSid = req.body.MessageSid;
   const numMedia = parseInt(req.body.NumMedia || "0");
 
-  // Ignore si pas de contenu du tout
   if (!from || (text.trim().length === 0 && numMedia === 0)) return res.status(200).send('');
 
   if (!validateTwilioSignature(req)) {
@@ -425,6 +443,11 @@ app.post("/webhook", async (req, res) => {
   if (alreadyDone) {
     console.log(`Message déjà traité: ${messageSid}`);
     return res.status(200).send('');
+  }
+
+  // Détection urgence
+  if (isUrgent(text)) {
+    console.log(`🚨 URGENCE détectée: ${text}`);
   }
 
   console.log(`📩 Message de ${from}: ${text || "[image]"}`);
@@ -451,7 +474,7 @@ app.post("/webhook", async (req, res) => {
       await saveMessage(from, "user", `[Image envoyée] ${text}`);
       reply = await handleImageMessage(req, history, systemWithMemory);
     } else {
-      // ── MESSAGE TEXTE NORMAL ──
+      // ── MESSAGE TEXTE ──
       await saveMessage(from, "user", text);
       history.push({ role: "user", content: text });
 
@@ -466,10 +489,7 @@ app.post("/webhook", async (req, res) => {
     }
 
     await saveMessage(from, "assistant", reply);
-
-    // Détection mémoire en arrière-plan
     detectAndSaveMemory(text, reply).catch(err => console.error("Mémoire auto:", err.message));
-
     await sendWhatsApp(from, reply);
     res.status(200).send('');
 
