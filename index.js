@@ -3,12 +3,28 @@ const express = require("express");
 const axios = require("axios");
 const Anthropic = require("@anthropic-ai/sdk");
 const { Pool } = require("pg");
+const twilio = require("twilio");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ═══════════════════════════════
+// SÉCURITÉ
+// ═══════════════════════════════
+
+// Seul ce numéro peut parler à Jarvis
+const ALLOWED_NUMBER = "whatsapp:+33625510496";
+
+// Validation signature Twilio (vérifie que la requête vient bien de Twilio)
+function validateTwilioSignature(req) {
+  const authToken = process.env.TWILIO_TOKEN;
+  const twilioSignature = req.headers["x-twilio-signature"];
+  const url = `https://${req.headers.host}${req.originalUrl}`;
+  return twilio.validateRequest(authToken, twilioSignature, url, req.body);
+}
 
 // Connexion base de données
 const pool = new Pool({
@@ -122,7 +138,7 @@ RÈGLES ABSOLUES
 2. Toujours proposer avant d'exécuter
 3. Actions simples → confirmation oui/non
 4. Actions risquées → double confirmation  
-5. Actions lecture seule → réponse directe
+5. Actions risquées → double confirmation  
 6. Concis et actionnable, jamais de blabla
 7. Ne jamais redemander des infos déjà connues
 8. Tu as une mémoire persistante — utilise-la pour t'améliorer continuellement
@@ -134,6 +150,19 @@ app.post("/webhook", async (req, res) => {
 
   // Body vide ou absent = callback de statut Twilio → ignorer
   if (!from || !text || text.trim().length === 0) return res.status(200).send('');
+
+  // ── SÉCURITÉ 1 : Validation signature Twilio ──
+  if (!validateTwilioSignature(req)) {
+    console.warn(`⚠️ Requête rejetée : signature Twilio invalide (from: ${from})`);
+    return res.status(403).send('Forbidden');
+  }
+
+  // ── SÉCURITÉ 2 : Whitelist numéro ──
+  if (from !== ALLOWED_NUMBER) {
+    console.warn(`⚠️ Accès refusé : numéro non autorisé (${from})`);
+    return res.status(200).send('');
+  }
+
   // Ignorer les messages de notre propre numéro Twilio
   if (from === `whatsapp:${process.env.TWILIO_NUMBER}`) return res.status(200).send('');
 
