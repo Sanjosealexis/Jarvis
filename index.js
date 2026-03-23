@@ -14,11 +14,8 @@ const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 // ═══════════════════════════════
 // SÉCURITÉ
 // ═══════════════════════════════
-
-// Seul ce numéro peut parler à Jarvis
 const ALLOWED_NUMBER = "whatsapp:+33625510496";
 
-// Validation signature Twilio (vérifie que la requête vient bien de Twilio)
 function validateTwilioSignature(req) {
   const authToken = process.env.TWILIO_TOKEN;
   const twilioSignature = req.headers["x-twilio-signature"];
@@ -26,13 +23,14 @@ function validateTwilioSignature(req) {
   return twilio.validateRequest(authToken, twilioSignature, url, req.body);
 }
 
-// Connexion base de données
+// ═══════════════════════════════
+// BASE DE DONNÉES
+// ═══════════════════════════════
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL?.includes("railway.internal") ? false : { rejectUnauthorized: false }
 });
 
-// Création des tables au démarrage
 async function initDB() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS conversations (
@@ -48,22 +46,25 @@ async function initDB() {
       value TEXT NOT NULL,
       updated_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS processed_messages (
+      message_sid VARCHAR(100) PRIMARY KEY,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
   `);
   console.log("Base de données initialisée ✅");
 }
 
-// Récupère les 20 derniers messages d'un utilisateur
+// Historique réduit à 10 messages
 async function getHistory(phone) {
   const result = await pool.query(
     `SELECT role, content FROM conversations 
      WHERE user_phone = $1 
-     ORDER BY created_at DESC LIMIT 20`,
+     ORDER BY created_at DESC LIMIT 10`,
     [phone]
   );
   return result.rows.reverse();
 }
 
-// Sauvegarde un message
 async function saveMessage(phone, role, content) {
   await pool.query(
     `INSERT INTO conversations (user_phone, role, content) VALUES ($1, $2, $3)`,
@@ -71,14 +72,18 @@ async function saveMessage(phone, role, content) {
   );
 }
 
-// Récupère la mémoire long terme
+// Mémoire long terme plafonnée à 20 entrées
 async function getMemory() {
-  const result = await pool.query(`SELECT key, value FROM memory`);
+  const result = await pool.query(`SELECT key, value FROM memory ORDER BY updated_at DESC LIMIT 20`);
   return result.rows.map(r => `${r.key}: ${r.value}`).join("\n");
 }
 
-// Sauvegarde un élément de mémoire
 async function saveMemory(key, value) {
+  // Vérifie si on dépasse 20 entrées → supprime la plus ancienne
+  const count = await pool.query(`SELECT COUNT(*) FROM memory`);
+  if (parseInt(count.rows[0].count) >= 20) {
+    await pool.query(`DELETE FROM memory WHERE id = (SELECT id FROM memory ORDER BY updated_at ASC LIMIT 1)`);
+  }
   await pool.query(
     `INSERT INTO memory (key, value) 
      VALUES ($1, $2)
@@ -87,6 +92,64 @@ async function saveMemory(key, value) {
   );
 }
 
+// Déduplication : vérifie si le message a déjà été traité
+async function isAlreadyProcessed(messageSid) {
+  if (!messageSid) return false;
+  try {
+    const result = await pool.query(
+      `INSERT INTO processed_messages (message_sid) VALUES ($1) ON CONFLICT DO NOTHING RETURNING message_sid`,
+      [messageSid]
+    );
+    return result.rows.length === 0; // Si rien inséré = déjà traité
+  } catch {
+    return false;
+  }
+}
+
+// ═══════════════════════════════
+// DÉTECTION MÉMOIRE AUTOMATIQUE
+// ═══════════════════════════════
+async function detectAndSaveMemory(userText, assistantReply) {
+  // Manuel : si l'utilisateur demande explicitement
+  const manualTrigger = ["retiens", "souviens", "note que", "mémorise", "n'oublie pas"];
+  if (manualTrigger.some(t => userText.toLowerCase().includes(t))) {
+    await saveMemory(`note_${Date.now()}`, userText);
+    console.log("Mémoire sauvegardée (manuel)");
+    return;
+  }
+
+  // Automatique : on demande à Claude si c'est important à retenir
+  try {
+    const check = await anthropic.messages.create({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 200,
+      messages: [{
+        role: "user",
+        content: `Message utilisateur: "${userText}"
+Réponse assistant: "${assistantReply}"
+
+Est-ce que cet échange contient une information importante à mémoriser sur l'utilisateur ou son business (décision stratégique, donnée clé, changement de situation) ?
+Si oui, réponds UNIQUEMENT avec: MEMORISER|clé_courte|valeur_à_retenir
+Si non, réponds UNIQUEMENT avec: IGNORER`
+      }]
+    });
+
+    const decision = check.content[0].text.trim();
+    if (decision.startsWith("MEMORISER|")) {
+      const parts = decision.split("|");
+      if (parts.length === 3) {
+        await saveMemory(parts[1], parts[2]);
+        console.log(`Mémoire sauvegardée (auto): ${parts[1]} = ${parts[2]}`);
+      }
+    }
+  } catch (err) {
+    console.error("Erreur détection mémoire auto:", err.message);
+  }
+}
+
+// ═══════════════════════════════
+// SYSTEM PROMPT
+// ═══════════════════════════════
 const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant personnel IA d'Alexis San Jose, entrepreneur e-commerce basé en Gironde, France. Tu gères tout son business de A à Z. Tu es son bras droit opérationnel.
 
 ═══════════════════════════════
@@ -137,16 +200,20 @@ RÈGLES ABSOLUES
 1. Toujours répondre en français
 2. Toujours proposer avant d'exécuter
 3. Actions simples → confirmation oui/non
-4. Actions risquées → double confirmation  
-5. Actions risquées → double confirmation  
+4. Actions risquées → double confirmation
+5. Actions lecture seule → réponse directe
 6. Concis et actionnable, jamais de blabla
 7. Ne jamais redemander des infos déjà connues
 8. Tu as une mémoire persistante — utilise-la pour t'améliorer continuellement
 9. Si tu apprends quelque chose d'important sur Alexis ou son business, mémorise-le`;
 
+// ═══════════════════════════════
+// WEBHOOK
+// ═══════════════════════════════
 app.post("/webhook", async (req, res) => {
   const from = req.body.From;
   const text = req.body.Body;
+  const messageSid = req.body.MessageSid;
 
   // Body vide ou absent = callback de statut Twilio → ignorer
   if (!from || !text || text.trim().length === 0) return res.status(200).send('');
@@ -166,19 +233,23 @@ app.post("/webhook", async (req, res) => {
   // Ignorer les messages de notre propre numéro Twilio
   if (from === `whatsapp:${process.env.TWILIO_NUMBER}`) return res.status(200).send('');
 
+  // ── DÉDUPLICATION ──
+  const alreadyDone = await isAlreadyProcessed(messageSid);
+  if (alreadyDone) {
+    console.log(`Message déjà traité, ignoré: ${messageSid}`);
+    return res.status(200).send('');
+  }
+
   console.log(`Message de ${from}: ${text}`);
 
   try {
-    // Récupère l'historique depuis la BDD
     const history = await getHistory(from);
     const longTermMemory = await getMemory();
 
-    // Sauvegarde le message utilisateur
     await saveMessage(from, "user", text);
     history.push({ role: "user", content: text });
 
-    // Système enrichi avec mémoire long terme
-    const systemWithMemory = JARVIS_SYSTEM + 
+    const systemWithMemory = JARVIS_SYSTEM +
       (longTermMemory ? `\n\n═══════════════════════════════\nMÉMOIRE LONG TERME\n═══════════════════════════════\n${longTermMemory}` : "");
 
     const response = await anthropic.messages.create({
@@ -189,14 +260,10 @@ app.post("/webhook", async (req, res) => {
     });
 
     const reply = response.content[0].text;
-
-    // Sauvegarde la réponse
     await saveMessage(from, "assistant", reply);
 
-    // Détection automatique d'infos à mémoriser
-    if (text.toLowerCase().includes("retiens") || text.toLowerCase().includes("souviens") || text.toLowerCase().includes("note que")) {
-      await saveMemory(`note_${Date.now()}`, text);
-    }
+    // Détection mémoire : manuelle + automatique
+    await detectAndSaveMemory(text, reply);
 
     // Envoi WhatsApp via Twilio
     await axios.post(
