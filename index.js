@@ -24,6 +24,44 @@ function validateTwilioSignature(req) {
 }
 
 // ═══════════════════════════════
+// SÉLECTION DU MODÈLE
+// ═══════════════════════════════
+const MODEL_SONNET = "claude-sonnet-4-20250514";
+const MODEL_HAIKU = "claude-haiku-4-5-20251001";
+
+function selectModel(text) {
+  const t = text.toLowerCase();
+
+  // Mots clés qui nécessitent Sonnet (tâches complexes)
+  const sonnetTriggers = [
+    "analyse", "analyser", "analysons",
+    "stratégie", "stratégique",
+    "rédige", "rédiger", "écris", "propose",
+    "optimise", "optimiser",
+    "campagne", "performance", "résultat",
+    "plan", "planning",
+    "compare", "comparaison",
+    "explique", "comment faire",
+    "aide moi à", "help me",
+    "diagnostic", "problème",
+    "améliore", "améliorer",
+    "crée", "créer", "génère",
+    "rapport", "bilan",
+    "description produit", "fiche produit",
+    "email", "mail", "message",
+    "pourquoi", "comment se fait"
+  ];
+
+  if (sonnetTriggers.some(trigger => t.includes(trigger))) {
+    console.log(`🧠 Modèle: Sonnet (tâche complexe)`);
+    return MODEL_SONNET;
+  }
+
+  console.log(`⚡ Modèle: Haiku (message simple)`);
+  return MODEL_HAIKU;
+}
+
+// ═══════════════════════════════
 // BASE DE DONNÉES
 // ═══════════════════════════════
 const pool = new Pool({
@@ -52,16 +90,10 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
-
-  // Ajoute la colonne tags si elle n'existe pas encore (migration douce)
-  await pool.query(`
-    ALTER TABLE memory ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '';
-  `);
-
+  await pool.query(`ALTER TABLE memory ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '';`);
   console.log("Base de données initialisée ✅");
 }
 
-// Historique 10 derniers messages
 async function getHistory(phone) {
   const result = await pool.query(
     `SELECT role, content FROM conversations 
@@ -80,14 +112,11 @@ async function saveMessage(phone, role, content) {
 }
 
 // ═══════════════════════════════
-// MÉMOIRE INFINIE AVEC RECHERCHE PAR TAGS
+// MÉMOIRE INFINIE PAR TAGS
 // ═══════════════════════════════
-
-// Récupère les souvenirs pertinents selon le message en cours
 async function getRelevantMemory(userText) {
   const text = userText.toLowerCase();
 
-  // Catégories de tags à détecter
   const tagMap = {
     dododog: ["dododog", "chien", "panier", "lit", "tapis", "harnais", "collier"],
     verano: ["verano", "lumière", "luminaire", "lampe", "lustre", "suspension"],
@@ -101,7 +130,6 @@ async function getRelevantMemory(userText) {
     dsers: ["dsers", "fournisseur", "aliexpress", "commande"],
   };
 
-  // Détecte les tags pertinents dans le message
   const matchedTags = [];
   for (const [tag, keywords] of Object.entries(tagMap)) {
     if (keywords.some(k => text.includes(k))) {
@@ -111,14 +139,12 @@ async function getRelevantMemory(userText) {
 
   let result;
   if (matchedTags.length > 0) {
-    // Récupère les souvenirs dont les tags correspondent
     const tagConditions = matchedTags.map((_, i) => `tags ILIKE $${i + 1}`).join(" OR ");
     const tagValues = matchedTags.map(t => `%${t}%`);
     result = await pool.query(
       `SELECT key, value FROM memory WHERE ${tagConditions} ORDER BY updated_at DESC LIMIT 10`,
       tagValues
     );
-    // Si peu de résultats, complète avec les souvenirs généraux récents
     if (result.rows.length < 5) {
       const extra = await pool.query(
         `SELECT key, value FROM memory WHERE tags = '' OR tags IS NULL ORDER BY updated_at DESC LIMIT 5`
@@ -126,7 +152,6 @@ async function getRelevantMemory(userText) {
       result.rows = [...result.rows, ...extra.rows];
     }
   } else {
-    // Message générique → récupère les 10 souvenirs les plus récents
     result = await pool.query(
       `SELECT key, value FROM memory ORDER BY updated_at DESC LIMIT 10`
     );
@@ -145,7 +170,6 @@ async function saveMemory(key, value, tags = "") {
   console.log(`💾 Mémoire sauvegardée: [${tags}] ${key} = ${value}`);
 }
 
-// Déduplication
 async function isAlreadyProcessed(messageSid) {
   if (!messageSid) return false;
   try {
@@ -163,17 +187,15 @@ async function isAlreadyProcessed(messageSid) {
 // DÉTECTION MÉMOIRE AUTO
 // ═══════════════════════════════
 async function detectAndSaveMemory(userText, assistantReply) {
-  // Manuel
   const manualTrigger = ["retiens", "souviens", "note que", "mémorise", "n'oublie pas"];
   if (manualTrigger.some(t => userText.toLowerCase().includes(t))) {
     await saveMemory(`note_${Date.now()}`, userText, "manuel");
     return;
   }
 
-  // Automatique via Claude
   try {
     const check = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: MODEL_HAIKU, // Toujours Haiku pour la détection mémoire → économique
       max_tokens: 200,
       messages: [{
         role: "user",
@@ -299,8 +321,11 @@ app.post("/webhook", async (req, res) => {
     const systemWithMemory = JARVIS_SYSTEM +
       (relevantMemory ? `\n\n═══════════════════════════════\nMÉMOIRE PERTINENTE\n═══════════════════════════════\n${relevantMemory}` : "");
 
+    // Sélection automatique du modèle
+    const model = selectModel(text);
+
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
+      model: model,
       max_tokens: 1024,
       system: systemWithMemory,
       messages: history,
@@ -309,7 +334,7 @@ app.post("/webhook", async (req, res) => {
     const reply = response.content[0].text;
     await saveMessage(from, "assistant", reply);
 
-    // Détection mémoire en arrière-plan (sans bloquer la réponse)
+    // Détection mémoire en arrière-plan
     detectAndSaveMemory(text, reply).catch(err => console.error("Mémoire auto:", err.message));
 
     await axios.post(
