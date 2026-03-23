@@ -44,6 +44,7 @@ async function initDB() {
       id SERIAL PRIMARY KEY,
       key VARCHAR(255) UNIQUE NOT NULL,
       value TEXT NOT NULL,
+      tags TEXT DEFAULT '',
       updated_at TIMESTAMP DEFAULT NOW()
     );
     CREATE TABLE IF NOT EXISTS processed_messages (
@@ -51,10 +52,16 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+
+  // Ajoute la colonne tags si elle n'existe pas encore (migration douce)
+  await pool.query(`
+    ALTER TABLE memory ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '';
+  `);
+
   console.log("Base de données initialisée ✅");
 }
 
-// Historique réduit à 10 messages
+// Historique 10 derniers messages
 async function getHistory(phone) {
   const result = await pool.query(
     `SELECT role, content FROM conversations 
@@ -72,27 +79,73 @@ async function saveMessage(phone, role, content) {
   );
 }
 
-// Mémoire long terme plafonnée à 20 entrées
-async function getMemory() {
-  const result = await pool.query(`SELECT key, value FROM memory ORDER BY updated_at DESC LIMIT 20`);
+// ═══════════════════════════════
+// MÉMOIRE INFINIE AVEC RECHERCHE PAR TAGS
+// ═══════════════════════════════
+
+// Récupère les souvenirs pertinents selon le message en cours
+async function getRelevantMemory(userText) {
+  const text = userText.toLowerCase();
+
+  // Catégories de tags à détecter
+  const tagMap = {
+    dododog: ["dododog", "chien", "panier", "lit", "tapis", "harnais", "collier"],
+    verano: ["verano", "lumière", "luminaire", "lampe", "lustre", "suspension"],
+    vellure: ["vellure"],
+    dodobaby: ["dodobaby", "bébé", "poussette"],
+    google_ads: ["google", "ads", "pmax", "campagne", "budget", "enchère", "cpc"],
+    gmc: ["gmc", "merchant", "fiche", "produit", "feed", "flux"],
+    shopify: ["shopify", "boutique", "thème", "liquid", "section"],
+    finance: ["chiffre", "vente", "revenu", "dépense", "coût", "budget", "euro"],
+    simprosys: ["simprosys", "custom label", "flux"],
+    dsers: ["dsers", "fournisseur", "aliexpress", "commande"],
+  };
+
+  // Détecte les tags pertinents dans le message
+  const matchedTags = [];
+  for (const [tag, keywords] of Object.entries(tagMap)) {
+    if (keywords.some(k => text.includes(k))) {
+      matchedTags.push(tag);
+    }
+  }
+
+  let result;
+  if (matchedTags.length > 0) {
+    // Récupère les souvenirs dont les tags correspondent
+    const tagConditions = matchedTags.map((_, i) => `tags ILIKE $${i + 1}`).join(" OR ");
+    const tagValues = matchedTags.map(t => `%${t}%`);
+    result = await pool.query(
+      `SELECT key, value FROM memory WHERE ${tagConditions} ORDER BY updated_at DESC LIMIT 10`,
+      tagValues
+    );
+    // Si peu de résultats, complète avec les souvenirs généraux récents
+    if (result.rows.length < 5) {
+      const extra = await pool.query(
+        `SELECT key, value FROM memory WHERE tags = '' OR tags IS NULL ORDER BY updated_at DESC LIMIT 5`
+      );
+      result.rows = [...result.rows, ...extra.rows];
+    }
+  } else {
+    // Message générique → récupère les 10 souvenirs les plus récents
+    result = await pool.query(
+      `SELECT key, value FROM memory ORDER BY updated_at DESC LIMIT 10`
+    );
+  }
+
   return result.rows.map(r => `${r.key}: ${r.value}`).join("\n");
 }
 
-async function saveMemory(key, value) {
-  // Vérifie si on dépasse 20 entrées → supprime la plus ancienne
-  const count = await pool.query(`SELECT COUNT(*) FROM memory`);
-  if (parseInt(count.rows[0].count) >= 20) {
-    await pool.query(`DELETE FROM memory WHERE id = (SELECT id FROM memory ORDER BY updated_at ASC LIMIT 1)`);
-  }
+async function saveMemory(key, value, tags = "") {
   await pool.query(
-    `INSERT INTO memory (key, value) 
-     VALUES ($1, $2)
-     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
-    [key, value]
+    `INSERT INTO memory (key, value, tags) 
+     VALUES ($1, $2, $3)
+     ON CONFLICT (key) DO UPDATE SET value = $2, tags = $3, updated_at = NOW()`,
+    [key, value, tags]
   );
+  console.log(`💾 Mémoire sauvegardée: [${tags}] ${key} = ${value}`);
 }
 
-// Déduplication : vérifie si le message a déjà été traité
+// Déduplication
 async function isAlreadyProcessed(messageSid) {
   if (!messageSid) return false;
   try {
@@ -100,46 +153,45 @@ async function isAlreadyProcessed(messageSid) {
       `INSERT INTO processed_messages (message_sid) VALUES ($1) ON CONFLICT DO NOTHING RETURNING message_sid`,
       [messageSid]
     );
-    return result.rows.length === 0; // Si rien inséré = déjà traité
+    return result.rows.length === 0;
   } catch {
     return false;
   }
 }
 
 // ═══════════════════════════════
-// DÉTECTION MÉMOIRE AUTOMATIQUE
+// DÉTECTION MÉMOIRE AUTO
 // ═══════════════════════════════
 async function detectAndSaveMemory(userText, assistantReply) {
-  // Manuel : si l'utilisateur demande explicitement
+  // Manuel
   const manualTrigger = ["retiens", "souviens", "note que", "mémorise", "n'oublie pas"];
   if (manualTrigger.some(t => userText.toLowerCase().includes(t))) {
-    await saveMemory(`note_${Date.now()}`, userText);
-    console.log("Mémoire sauvegardée (manuel)");
+    await saveMemory(`note_${Date.now()}`, userText, "manuel");
     return;
   }
 
-  // Automatique : on demande à Claude si c'est important à retenir
+  // Automatique via Claude
   try {
     const check = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 200,
       messages: [{
         role: "user",
-        content: `Message utilisateur: "${userText}"
-Réponse assistant: "${assistantReply}"
+        content: `Message: "${userText}"
+Réponse: "${assistantReply}"
 
-Est-ce que cet échange contient une information importante à mémoriser sur l'utilisateur ou son business (décision stratégique, donnée clé, changement de situation) ?
-Si oui, réponds UNIQUEMENT avec: MEMORISER|clé_courte|valeur_à_retenir
-Si non, réponds UNIQUEMENT avec: IGNORER`
+Est-ce que cet échange contient une info importante à mémoriser (décision, chiffre clé, changement de situation, préférence) ?
+Si oui: MEMORISER|clé_courte|valeur_à_retenir|tag1,tag2,tag3
+Tags possibles: dododog, verano, vellure, dodobaby, google_ads, gmc, shopify, finance, simprosys, dsers, general
+Si non: IGNORER`
       }]
     });
 
     const decision = check.content[0].text.trim();
     if (decision.startsWith("MEMORISER|")) {
       const parts = decision.split("|");
-      if (parts.length === 3) {
-        await saveMemory(parts[1], parts[2]);
-        console.log(`Mémoire sauvegardée (auto): ${parts[1]} = ${parts[2]}`);
+      if (parts.length === 4) {
+        await saveMemory(parts[1], parts[2], parts[3]);
       }
     }
   } catch (err) {
@@ -215,42 +267,37 @@ app.post("/webhook", async (req, res) => {
   const text = req.body.Body;
   const messageSid = req.body.MessageSid;
 
-  // Body vide ou absent = callback de statut Twilio → ignorer
   if (!from || !text || text.trim().length === 0) return res.status(200).send('');
 
-  // ── SÉCURITÉ 1 : Validation signature Twilio ──
   if (!validateTwilioSignature(req)) {
-    console.warn(`⚠️ Requête rejetée : signature Twilio invalide (from: ${from})`);
+    console.warn(`⚠️ Signature invalide (${from})`);
     return res.status(403).send('Forbidden');
   }
 
-  // ── SÉCURITÉ 2 : Whitelist numéro ──
   if (from !== ALLOWED_NUMBER) {
-    console.warn(`⚠️ Accès refusé : numéro non autorisé (${from})`);
+    console.warn(`⚠️ Numéro non autorisé (${from})`);
     return res.status(200).send('');
   }
 
-  // Ignorer les messages de notre propre numéro Twilio
   if (from === `whatsapp:${process.env.TWILIO_NUMBER}`) return res.status(200).send('');
 
-  // ── DÉDUPLICATION ──
   const alreadyDone = await isAlreadyProcessed(messageSid);
   if (alreadyDone) {
-    console.log(`Message déjà traité, ignoré: ${messageSid}`);
+    console.log(`Message déjà traité: ${messageSid}`);
     return res.status(200).send('');
   }
 
-  console.log(`Message de ${from}: ${text}`);
+  console.log(`📩 Message de ${from}: ${text}`);
 
   try {
     const history = await getHistory(from);
-    const longTermMemory = await getMemory();
+    const relevantMemory = await getRelevantMemory(text);
 
     await saveMessage(from, "user", text);
     history.push({ role: "user", content: text });
 
     const systemWithMemory = JARVIS_SYSTEM +
-      (longTermMemory ? `\n\n═══════════════════════════════\nMÉMOIRE LONG TERME\n═══════════════════════════════\n${longTermMemory}` : "");
+      (relevantMemory ? `\n\n═══════════════════════════════\nMÉMOIRE PERTINENTE\n═══════════════════════════════\n${relevantMemory}` : "");
 
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
@@ -262,10 +309,9 @@ app.post("/webhook", async (req, res) => {
     const reply = response.content[0].text;
     await saveMessage(from, "assistant", reply);
 
-    // Détection mémoire : manuelle + automatique
-    await detectAndSaveMemory(text, reply);
+    // Détection mémoire en arrière-plan (sans bloquer la réponse)
+    detectAndSaveMemory(text, reply).catch(err => console.error("Mémoire auto:", err.message));
 
-    // Envoi WhatsApp via Twilio
     await axios.post(
       `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
       new URLSearchParams({
