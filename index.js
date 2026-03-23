@@ -131,13 +131,11 @@ RÈGLES ABSOLUES
 app.post("/webhook", async (req, res) => {
   const from = req.body.From;
   const text = req.body.Body;
-  const status = req.body.SmsStatus || req.body.MessageStatus;
-  
-  // Ignore les callbacks de statut et les messages vides
-  if (!from || !text || status) return res.sendStatus(200);
-  if (text.trim().length === 0) return res.sendStatus(200);
-  // Ignore les messages qui viennent du numéro Twilio lui-même
-  if (from === `whatsapp:${process.env.TWILIO_NUMBER}`) return res.sendStatus(200);
+
+  // Body vide ou absent = callback de statut Twilio → ignorer
+  if (!from || !text || text.trim().length === 0) return res.status(200).send('');
+  // Ignorer les messages de notre propre numéro Twilio
+  if (from === `whatsapp:${process.env.TWILIO_NUMBER}`) return res.status(200).send('');
 
   console.log(`Message de ${from}: ${text}`);
 
@@ -187,10 +185,10 @@ app.post("/webhook", async (req, res) => {
       }
     );
 
-    res.sendStatus(200);
+    res.status(200).send('');
   } catch (err) {
     console.error("Erreur:", err.message);
-    res.sendStatus(200);
+    res.status(200).send('');
   }
 });
 
