@@ -31,8 +31,6 @@ const MODEL_HAIKU = "claude-haiku-4-5-20251001";
 
 function selectModel(text) {
   const t = text.toLowerCase();
-
-  // Mots clés qui nécessitent Sonnet (tâches complexes)
   const sonnetTriggers = [
     "analyse", "analyser", "analysons",
     "stratégie", "stratégique",
@@ -42,21 +40,19 @@ function selectModel(text) {
     "plan", "planning",
     "compare", "comparaison",
     "explique", "comment faire",
-    "aide moi à", "help me",
+    "aide moi à",
     "diagnostic", "problème",
     "améliore", "améliorer",
     "crée", "créer", "génère",
     "rapport", "bilan",
     "description produit", "fiche produit",
-    "email", "mail", "message",
+    "email", "mail",
     "pourquoi", "comment se fait"
   ];
-
   if (sonnetTriggers.some(trigger => t.includes(trigger))) {
     console.log(`🧠 Modèle: Sonnet (tâche complexe)`);
     return MODEL_SONNET;
   }
-
   console.log(`⚡ Modèle: Haiku (message simple)`);
   return MODEL_HAIKU;
 }
@@ -116,7 +112,6 @@ async function saveMessage(phone, role, content) {
 // ═══════════════════════════════
 async function getRelevantMemory(userText) {
   const text = userText.toLowerCase();
-
   const tagMap = {
     dododog: ["dododog", "chien", "panier", "lit", "tapis", "harnais", "collier"],
     verano: ["verano", "lumière", "luminaire", "lampe", "lustre", "suspension"],
@@ -132,9 +127,7 @@ async function getRelevantMemory(userText) {
 
   const matchedTags = [];
   for (const [tag, keywords] of Object.entries(tagMap)) {
-    if (keywords.some(k => text.includes(k))) {
-      matchedTags.push(tag);
-    }
+    if (keywords.some(k => text.includes(k))) matchedTags.push(tag);
   }
 
   let result;
@@ -152,11 +145,8 @@ async function getRelevantMemory(userText) {
       result.rows = [...result.rows, ...extra.rows];
     }
   } else {
-    result = await pool.query(
-      `SELECT key, value FROM memory ORDER BY updated_at DESC LIMIT 10`
-    );
+    result = await pool.query(`SELECT key, value FROM memory ORDER BY updated_at DESC LIMIT 10`);
   }
-
   return result.rows.map(r => `${r.key}: ${r.value}`).join("\n");
 }
 
@@ -178,9 +168,7 @@ async function isAlreadyProcessed(messageSid) {
       [messageSid]
     );
     return result.rows.length === 0;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 // ═══════════════════════════════
@@ -192,10 +180,9 @@ async function detectAndSaveMemory(userText, assistantReply) {
     await saveMemory(`note_${Date.now()}`, userText, "manuel");
     return;
   }
-
   try {
     const check = await anthropic.messages.create({
-      model: MODEL_HAIKU, // Toujours Haiku pour la détection mémoire → économique
+      model: MODEL_HAIKU,
       max_tokens: 200,
       messages: [{
         role: "user",
@@ -208,17 +195,146 @@ Tags possibles: dododog, verano, vellure, dodobaby, google_ads, gmc, shopify, fi
 Si non: IGNORER`
       }]
     });
-
     const decision = check.content[0].text.trim();
     if (decision.startsWith("MEMORISER|")) {
       const parts = decision.split("|");
-      if (parts.length === 4) {
-        await saveMemory(parts[1], parts[2], parts[3]);
-      }
+      if (parts.length === 4) await saveMemory(parts[1], parts[2], parts[3]);
     }
   } catch (err) {
     console.error("Erreur détection mémoire auto:", err.message);
   }
+}
+
+// ═══════════════════════════════
+// COMMANDES RAPIDES
+// ═══════════════════════════════
+async function handleCommand(command) {
+  const cmd = command.trim().toLowerCase();
+
+  // /status — résumé de toutes les boutiques
+  if (cmd === "/status") {
+    const memory = await pool.query(`SELECT key, value, tags FROM memory ORDER BY updated_at DESC`);
+    if (memory.rows.length === 0) {
+      return "📊 *Status Jarvis*\n\nAucune donnée en mémoire pour l'instant. Parle-moi de tes boutiques pour que je commence à tout mémoriser.";
+    }
+    const byTag = {};
+    memory.rows.forEach(r => {
+      const tag = r.tags?.split(",")[0] || "general";
+      if (!byTag[tag]) byTag[tag] = [];
+      byTag[tag].push(`• ${r.key}: ${r.value}`);
+    });
+    let response = "📊 *Status Jarvis*\n\n";
+    for (const [tag, items] of Object.entries(byTag)) {
+      response += `*${tag.toUpperCase()}*\n${items.join("\n")}\n\n`;
+    }
+    return response.trim();
+  }
+
+  // /memory — affiche tout ce que Jarvis a en mémoire
+  if (cmd === "/memory") {
+    const memory = await pool.query(`SELECT key, value, tags, updated_at FROM memory ORDER BY updated_at DESC LIMIT 30`);
+    if (memory.rows.length === 0) return "🧠 *Mémoire vide*\n\nJe n'ai encore rien mémorisé.";
+    let response = `🧠 *Mémoire Jarvis (${memory.rows.length} entrées)*\n\n`;
+    memory.rows.forEach(r => {
+      const date = new Date(r.updated_at).toLocaleDateString("fr-FR");
+      response += `[${r.tags || "general"}] *${r.key}*: ${r.value} _(${date})_\n`;
+    });
+    return response.trim();
+  }
+
+  // /clear — remet l'historique de conversation à zéro
+  if (cmd === "/clear") {
+    await pool.query(`DELETE FROM conversations WHERE user_phone = $1`, [ALLOWED_NUMBER]);
+    return "🗑️ Historique de conversation effacé. On repart de zéro !";
+  }
+
+  // /help — liste des commandes
+  if (cmd === "/help") {
+    return `🤖 *Commandes Jarvis*\n\n/status — résumé de toutes tes boutiques\n/memory — tout ce que j'ai en mémoire\n/clear — efface l'historique de conversation\n/help — cette aide\n\nTu peux aussi m'envoyer des photos pour que je les analyse !`;
+  }
+
+  return null; // Pas une commande reconnue
+}
+
+// ═══════════════════════════════
+// GESTION DES IMAGES
+// ═══════════════════════════════
+async function handleImageMessage(req, history, systemWithMemory) {
+  const numMedia = parseInt(req.body.NumMedia || "0");
+  if (numMedia === 0) return null;
+
+  const mediaUrl = req.body.MediaUrl0;
+  const mediaType = req.body.MediaContentType0;
+  const caption = req.body.Body || "";
+
+  if (!mediaType?.startsWith("image/")) {
+    return "Je ne peux traiter que des images pour l'instant (pas de vidéo ni de document).";
+  }
+
+  console.log(`🖼️ Image reçue: ${mediaType} — ${mediaUrl}`);
+
+  // Télécharge l'image et la convertit en base64
+  const imageResponse = await axios.get(mediaUrl, {
+    responseType: "arraybuffer",
+    auth: {
+      username: process.env.TWILIO_SID,
+      password: process.env.TWILIO_TOKEN,
+    },
+  });
+
+  const base64Image = Buffer.from(imageResponse.data).toString("base64");
+  const mimeType = mediaType;
+
+  // Construit le message avec l'image
+  const userMessage = {
+    role: "user",
+    content: [
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: mimeType,
+          data: base64Image,
+        },
+      },
+      {
+        type: "text",
+        text: caption || "Analyse cette image et dis-moi ce que tu vois en lien avec mon business.",
+      },
+    ],
+  };
+
+  const messagesWithImage = [...history, userMessage];
+
+  const response = await anthropic.messages.create({
+    model: MODEL_SONNET, // Toujours Sonnet pour les images
+    max_tokens: 1024,
+    system: systemWithMemory,
+    messages: messagesWithImage,
+  });
+
+  console.log(`🧠 Modèle: Sonnet (analyse image)`);
+  return response.content[0].text;
+}
+
+// ═══════════════════════════════
+// ENVOI WHATSAPP
+// ═══════════════════════════════
+async function sendWhatsApp(to, body) {
+  await axios.post(
+    `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
+    new URLSearchParams({
+      From: `whatsapp:${process.env.TWILIO_NUMBER}`,
+      To: to,
+      Body: body,
+    }),
+    {
+      auth: {
+        username: process.env.TWILIO_SID,
+        password: process.env.TWILIO_TOKEN,
+      },
+    }
+  );
 }
 
 // ═══════════════════════════════
@@ -286,10 +402,12 @@ RÈGLES ABSOLUES
 // ═══════════════════════════════
 app.post("/webhook", async (req, res) => {
   const from = req.body.From;
-  const text = req.body.Body;
+  const text = req.body.Body || "";
   const messageSid = req.body.MessageSid;
+  const numMedia = parseInt(req.body.NumMedia || "0");
 
-  if (!from || !text || text.trim().length === 0) return res.status(200).send('');
+  // Ignore si pas de contenu du tout
+  if (!from || (text.trim().length === 0 && numMedia === 0)) return res.status(200).send('');
 
   if (!validateTwilioSignature(req)) {
     console.warn(`⚠️ Signature invalide (${from})`);
@@ -309,50 +427,52 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).send('');
   }
 
-  console.log(`📩 Message de ${from}: ${text}`);
+  console.log(`📩 Message de ${from}: ${text || "[image]"}`);
 
   try {
+    // ── COMMANDES RAPIDES ──
+    if (text.startsWith("/")) {
+      const commandReply = await handleCommand(text);
+      if (commandReply) {
+        await sendWhatsApp(from, commandReply);
+        return res.status(200).send('');
+      }
+    }
+
     const history = await getHistory(from);
     const relevantMemory = await getRelevantMemory(text);
-
-    await saveMessage(from, "user", text);
-    history.push({ role: "user", content: text });
-
     const systemWithMemory = JARVIS_SYSTEM +
       (relevantMemory ? `\n\n═══════════════════════════════\nMÉMOIRE PERTINENTE\n═══════════════════════════════\n${relevantMemory}` : "");
 
-    // Sélection automatique du modèle
-    const model = selectModel(text);
+    let reply;
 
-    const response = await anthropic.messages.create({
-      model: model,
-      max_tokens: 1024,
-      system: systemWithMemory,
-      messages: history,
-    });
+    // ── IMAGE ──
+    if (numMedia > 0) {
+      await saveMessage(from, "user", `[Image envoyée] ${text}`);
+      reply = await handleImageMessage(req, history, systemWithMemory);
+    } else {
+      // ── MESSAGE TEXTE NORMAL ──
+      await saveMessage(from, "user", text);
+      history.push({ role: "user", content: text });
 
-    const reply = response.content[0].text;
+      const model = selectModel(text);
+      const response = await anthropic.messages.create({
+        model: model,
+        max_tokens: 1024,
+        system: systemWithMemory,
+        messages: history,
+      });
+      reply = response.content[0].text;
+    }
+
     await saveMessage(from, "assistant", reply);
 
     // Détection mémoire en arrière-plan
     detectAndSaveMemory(text, reply).catch(err => console.error("Mémoire auto:", err.message));
 
-    await axios.post(
-      `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
-      new URLSearchParams({
-        From: `whatsapp:${process.env.TWILIO_NUMBER}`,
-        To: from,
-        Body: reply,
-      }),
-      {
-        auth: {
-          username: process.env.TWILIO_SID,
-          password: process.env.TWILIO_TOKEN,
-        },
-      }
-    );
-
+    await sendWhatsApp(from, reply);
     res.status(200).send('');
+
   } catch (err) {
     console.error("Erreur:", err.message);
     res.status(200).send('');
