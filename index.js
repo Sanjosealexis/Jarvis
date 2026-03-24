@@ -105,6 +105,13 @@ async function initDB() {
       status VARCHAR(20) DEFAULT 'pending',
       created_at TIMESTAMP DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS shopify_tokens (
+      id SERIAL PRIMARY KEY,
+      shop VARCHAR(255) UNIQUE NOT NULL,
+      access_token TEXT NOT NULL,
+      expires_at TIMESTAMP NOT NULL,
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
   `);
   await pool.query(`ALTER TABLE memory ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT '';`);
   console.log("Base de données initialisée ✅");
@@ -226,23 +233,67 @@ Si non: IGNORER`
 }
 
 // ═══════════════════════════════
-// SHOPIFY API — DODODOG
+// SHOPIFY API — TOKEN AUTOMATIQUE
 // ═══════════════════════════════
-const SHOPIFY_DODODOG = {
-  url: process.env.SHOPIFY_DODODOG_URL,
-  token: process.env.SHOPIFY_DODODOG_TOKEN,
-};
+const SHOPIFY_SHOP = process.env.SHOPIFY_DODODOG_URL;
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_DODODOG_CLIENT_ID;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_DODODOG_SECRET;
+
+// Récupère ou renouvelle le token Shopify automatiquement
+async function getShopifyToken() {
+  // Vérifie si on a un token valide en base
+  const cached = await pool.query(
+    `SELECT access_token, expires_at FROM shopify_tokens WHERE shop = $1`,
+    [SHOPIFY_SHOP]
+  );
+
+  if (cached.rows.length > 0) {
+    const { access_token, expires_at } = cached.rows[0];
+    // Token encore valide (avec 5 min de marge)
+    if (new Date(expires_at) > new Date(Date.now() + 5 * 60 * 1000)) {
+      return access_token;
+    }
+  }
+
+  // Obtenir un nouveau token via client_credentials
+  console.log("🔑 Renouvellement token Shopify...");
+  const response = await axios.post(
+    `https://${SHOPIFY_SHOP}/admin/oauth/access_token`,
+    new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: SHOPIFY_CLIENT_ID,
+      client_secret: SHOPIFY_CLIENT_SECRET,
+    }),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
+
+  const { access_token, expires_in } = response.data;
+  const expiresAt = new Date(Date.now() + (expires_in || 86399) * 1000);
+
+  // Sauvegarde en base
+  await pool.query(
+    `INSERT INTO shopify_tokens (shop, access_token, expires_at)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (shop) DO UPDATE SET access_token = $2, expires_at = $3, updated_at = NOW()`,
+    [SHOPIFY_SHOP, access_token, expiresAt]
+  );
+
+  console.log(`✅ Token Shopify obtenu, expire le ${expiresAt.toISOString()}`);
+  return access_token;
+}
 
 async function shopifyRequest(method, endpoint, data = null) {
   try {
-    const [clientId, clientSecret] = SHOPIFY_DODODOG.token.split(":");
-    const url = `https://${SHOPIFY_DODODOG.url}/admin/api/2024-01${endpoint}`;
-    console.log(`🛍️ Shopify ${method} ${url} (auth: ${clientId?.slice(0,8)}...)`);
+    const token = await getShopifyToken();
+    const url = `https://${SHOPIFY_SHOP}/admin/api/2024-01${endpoint}`;
+    console.log(`🛍️ Shopify ${method} ${endpoint}`);
     const config = {
       method,
       url,
-      headers: { "Content-Type": "application/json" },
-      auth: { username: clientId, password: clientSecret },
+      headers: {
+        "X-Shopify-Access-Token": token,
+        "Content-Type": "application/json",
+      },
     };
     if (data) config.data = data;
     const response = await axios(config);
