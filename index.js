@@ -235,12 +235,14 @@ const SHOPIFY_DODODOG = {
 
 async function shopifyRequest(method, endpoint, data = null) {
   const url = `https://${SHOPIFY_DODODOG.url}/admin/api/2024-01${endpoint}`;
+  const [clientId, clientSecret] = SHOPIFY_DODODOG.token.split(":");
   const config = {
     method,
     url,
-    headers: {
-      "X-Shopify-Access-Token": SHOPIFY_DODODOG.token,
-      "Content-Type": "application/json",
+    headers: { "Content-Type": "application/json" },
+    auth: {
+      username: clientId,
+      password: clientSecret,
     },
   };
   if (data) config.data = data;
@@ -248,7 +250,6 @@ async function shopifyRequest(method, endpoint, data = null) {
   return response.data;
 }
 
-// Lecture
 async function getShopifyOrders(limit = 10) {
   const data = await shopifyRequest("GET", `/orders.json?limit=${limit}&status=any`);
   return data.orders;
@@ -260,15 +261,14 @@ async function getShopifyProducts() {
 }
 
 async function getShopifyStats() {
+  const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const [orders, products] = await Promise.all([
-    shopifyRequest("GET", `/orders.json?limit=50&status=any&created_at_min=${new Date(Date.now() - 30*24*60*60*1000).toISOString()}`),
+    shopifyRequest("GET", `/orders.json?limit=250&status=any&created_at_min=${since}`),
     shopifyRequest("GET", `/products.json?limit=250`),
   ]);
-
   const totalRevenue = orders.orders
     .filter(o => o.financial_status === "paid")
     .reduce((sum, o) => sum + parseFloat(o.total_price), 0);
-
   return {
     orders_30j: orders.orders.length,
     revenue_30j: totalRevenue.toFixed(2),
@@ -280,12 +280,8 @@ async function getShopifyStats() {
 // ═══════════════════════════════
 // SYSTÈME DE VALIDATION — DOUBLE CONFIRMATION
 // ═══════════════════════════════
-
-// Sauvegarde une action en attente et retourne un aperçu pour validation
 async function createPendingAction(phone, actionType, actionData, preview) {
-  // Annule toute action en attente précédente
   await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
-
   const result = await pool.query(
     `INSERT INTO pending_actions (user_phone, action_type, action_data, preview) VALUES ($1, $2, $3, $4) RETURNING id`,
     [phone, actionType, JSON.stringify(actionData), preview]
@@ -304,7 +300,6 @@ async function getPendingAction(phone) {
 async function confirmPendingAction(phone) {
   const action = await getPendingAction(phone);
   if (!action) return null;
-
   await pool.query(`UPDATE pending_actions SET status = 'confirmed' WHERE id = $1`, [action.id]);
   return action;
 }
@@ -313,54 +308,20 @@ async function cancelPendingAction(phone) {
   await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
 }
 
-// Exécute une action Shopify confirmée
 async function executeShopifyAction(action) {
-  const data = action.action_data;
+  const data = typeof action.action_data === 'string' ? JSON.parse(action.action_data) : action.action_data;
 
   switch (action.action_type) {
-
     case "update_product": {
-      await shopifyRequest("PUT", `/products/${data.product_id}.json`, {
-        product: data.updates
-      });
+      await shopifyRequest("PUT", `/products/${data.product_id}.json`, { product: data.updates });
       return `✅ Produit mis à jour avec succès.`;
     }
-
     case "update_price": {
       await shopifyRequest("PUT", `/variants/${data.variant_id}.json`, {
         variant: { id: data.variant_id, price: data.new_price }
       });
       return `✅ Prix mis à jour : ${data.new_price}€`;
     }
-
-    case "bulk_update_first": {
-      // Applique la modification sur le premier produit uniquement pour validation
-      const product = data.products[0];
-      await shopifyRequest("PUT", `/products/${product.id}.json`, {
-        product: data.build_update(product)
-      });
-      return `✅ *Test appliqué sur 1 produit* : "${product.title}"\n\nVérifie sur Shopify que le résultat est correct.\nSi c'est bon, réponds *"confirmer tout"* pour appliquer aux ${data.products.length - 1} autres produits.\nSi ce n'est pas bon, réponds *"annuler"*.`;
-    }
-
-    case "bulk_update_all": {
-      // Applique sur tous les produits restants (sauf le premier déjà fait)
-      const products = data.products.slice(1);
-      let success = 0;
-      for (const product of products) {
-        try {
-          await shopifyRequest("PUT", `/products/${product.id}.json`, {
-            product: data.build_update(product)
-          });
-          success++;
-          // Pause pour éviter le rate limit Shopify
-          await new Promise(r => setTimeout(r, 500));
-        } catch (err) {
-          console.error(`Erreur produit ${product.id}:`, err.message);
-        }
-      }
-      return `✅ *Modification en masse terminée*\n\n• ${success}/${products.length} produits mis à jour avec succès.`;
-    }
-
     default:
       return `❌ Action inconnue : ${action.action_type}`;
   }
@@ -372,41 +333,19 @@ async function executeShopifyAction(action) {
 async function handleCommand(command, from) {
   const cmd = command.trim().toLowerCase();
 
-  // Confirmation d'une action en attente
   if (cmd === "oui" || cmd === "confirmer" || cmd === "ok go" || cmd === "valider") {
     const action = await confirmPendingAction(from);
     if (action) {
       console.log(`✅ Action confirmée: ${action.action_type}`);
       try {
-        const result = await executeShopifyAction(action);
-        return result;
+        return await executeShopifyAction(action);
       } catch (err) {
         return `❌ Erreur lors de l'exécution : ${err.message}`;
       }
     }
+    return null;
   }
 
-  // Confirmation finale pour les modifications en masse
-  if (cmd === "confirmer tout" || cmd === "oui tout" || cmd === "go tout") {
-    const action = await getPendingAction(from);
-    if (action && action.action_type === "bulk_update_first") {
-      await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE id = $1`, [action.id]);
-      // Crée une nouvelle action pour le reste
-      const bulkAllAction = {
-        ...action,
-        action_type: "bulk_update_all",
-        action_data: action.action_data,
-      };
-      try {
-        const result = await executeShopifyAction(bulkAllAction);
-        return result;
-      } catch (err) {
-        return `❌ Erreur : ${err.message}`;
-      }
-    }
-  }
-
-  // Annulation
   if (cmd === "non" || cmd === "annuler" || cmd === "cancel") {
     await cancelPendingAction(from);
     return `🚫 Action annulée. Aucune modification effectuée.`;
@@ -444,7 +383,7 @@ async function handleCommand(command, from) {
     return "🗑️ Historique effacé. On repart de zéro !";
   }
 
-  if (cmd === "/shopify" || cmd === "/stats") {
+  if (cmd === "/stats" || cmd === "/shopify") {
     try {
       const stats = await getShopifyStats();
       return `📊 *DodoDog — Stats 30 jours*\n\n• Commandes : ${stats.orders_30j}\n• Revenus : ${stats.revenue_30j}€\n• Produits actifs : ${stats.products_active}/${stats.products_total}`;
@@ -483,7 +422,7 @@ async function handleCommand(command, from) {
   }
 
   if (cmd === "/help") {
-    return `🤖 *Commandes Jarvis*\n\n*Info*\n/stats — stats DodoDog 30 jours\n/commandes — 5 dernières commandes\n/produits — liste des produits\n/status — mémoire par boutique\n/memory — tout ce que je sais\n\n*Gestion*\n/clear — efface l'historique\n\n*Validation*\noui / confirmer — valide une action\nnon / annuler — annule une action\nconfirmer tout — applique en masse\n\nTu peux aussi m'envoyer des 📸 photos !`;
+    return `🤖 *Commandes Jarvis*\n\n*Info*\n/stats — stats DodoDog 30 jours\n/commandes — 5 dernières commandes\n/produits — liste des produits\n/status — mémoire par boutique\n/memory — tout ce que je sais\n\n*Gestion*\n/clear — efface l'historique\n\n*Validation*\noui / confirmer — valide une action\nnon / annuler — annule une action\n\nTu peux aussi m'envoyer des 📸 photos !`;
   }
 
   return null;
@@ -495,27 +434,17 @@ async function handleCommand(command, from) {
 async function handleImageMessage(req, history, systemWithMemory) {
   const numMedia = parseInt(req.body.NumMedia || "0");
   if (numMedia === 0) return null;
-
   const mediaUrl = req.body.MediaUrl0;
   const mediaType = req.body.MediaContentType0;
   const caption = req.body.Body || "";
-
-  if (!mediaType?.startsWith("image/")) {
-    return "Je ne peux traiter que des images pour l'instant.";
-  }
+  if (!mediaType?.startsWith("image/")) return "Je ne peux traiter que des images pour l'instant.";
 
   console.log(`🖼️ Image reçue: ${mediaType}`);
-
   const imageResponse = await axios.get(mediaUrl, {
     responseType: "arraybuffer",
-    auth: {
-      username: process.env.TWILIO_SID,
-      password: process.env.TWILIO_TOKEN,
-    },
+    auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN },
   });
-
   const base64Image = Buffer.from(imageResponse.data).toString("base64");
-
   const userMessage = {
     role: "user",
     content: [
@@ -523,14 +452,12 @@ async function handleImageMessage(req, history, systemWithMemory) {
       { type: "text", text: caption || "Analyse cette image et dis-moi ce que tu vois en lien avec mon business." },
     ],
   };
-
   const response = await anthropic.messages.create({
     model: MODEL_SONNET,
     max_tokens: 1024,
     system: systemWithMemory,
     messages: [...history, userMessage],
   });
-
   console.log(`🧠 Modèle: Sonnet (analyse image)`);
   return response.content[0].text;
 }
@@ -539,13 +466,10 @@ async function handleImageMessage(req, history, systemWithMemory) {
 // ENVOI WHATSAPP
 // ═══════════════════════════════
 async function sendWhatsApp(to, body) {
-  // WhatsApp limite les messages à 1600 caractères
   const maxLength = 1600;
   if (body.length > maxLength) {
     const parts = [];
-    for (let i = 0; i < body.length; i += maxLength) {
-      parts.push(body.slice(i, i + maxLength));
-    }
+    for (let i = 0; i < body.length; i += maxLength) parts.push(body.slice(i, i + maxLength));
     for (const part of parts) {
       await axios.post(
         `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
@@ -574,17 +498,10 @@ Tu as accès à l'API Shopify de DodoDog en lecture et en écriture.
 RÈGLES DE VALIDATION OBLIGATOIRES
 ═══════════════════════════════
 AVANT toute modification Shopify, tu dois TOUJOURS :
-
 1. PROPOSER ce que tu vas faire avec un aperçu clair
 2. Attendre la confirmation "oui" ou "confirmer" d'Alexis
-3. Pour les modifications en masse (plusieurs produits) :
-   - Appliquer d'abord sur 1 seul produit test
-   - Montrer le résultat et demander validation
-   - Attendre "confirmer tout" avant d'appliquer aux autres
-4. Pour les actions risquées (suppression, changement de prix en masse) :
-   - Demander une double confirmation explicite
-   - Rappeler ce qui va être modifié
-
+3. Pour les modifications en masse : appliquer d'abord sur 1 seul produit test, montrer le résultat, attendre "confirmer tout"
+4. Pour les actions risquées : demander une double confirmation explicite
 Tu ne modifies JAMAIS Shopify sans confirmation explicite d'Alexis.
 
 ═══════════════════════════════
@@ -683,30 +600,18 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send('');
     }
 
-    // ── VÉRIFICATION ACTION EN ATTENTE ──
-    // Si une action est en attente et que le message ressemble à une confirmation/annulation
-    const pendingAction = await getPendingAction(from);
-    const lowerText = text.toLowerCase().trim();
-    if (pendingAction && (lowerText === "oui" || lowerText === "non" || lowerText === "confirmer" || lowerText === "annuler")) {
-      const cmdReply2 = await handleCommand(text, from);
-      if (cmdReply2) {
-        await sendWhatsApp(from, cmdReply2);
-        return res.status(200).send('');
-      }
-    }
-
     const history = await getHistory(from);
     const relevantMemory = await getRelevantMemory(text);
 
     // Injecte les données Shopify si la question concerne la boutique
     let shopifyContext = "";
-    const shopifyKeywords = ["commande", "vente", "produit", "stock", "prix", "revenue", "chiffre", "boutique", "shopify"];
+    const shopifyKeywords = ["commande", "vente", "produit", "stock", "prix", "revenu", "chiffre", "boutique", "shopify"];
     if (shopifyKeywords.some(k => text.toLowerCase().includes(k))) {
       try {
         const stats = await getShopifyStats();
         shopifyContext = `\n\n═══════════════════════════════\nDONNÉES SHOPIFY DODODOG EN TEMPS RÉEL\n═══════════════════════════════\nCommandes (30j): ${stats.orders_30j}\nRevenu (30j): ${stats.revenue_30j}€\nProduits actifs: ${stats.products_active}/${stats.products_total}`;
       } catch (err) {
-        console.error("Erreur récupération stats Shopify:", err.message);
+        console.error("Erreur stats Shopify:", err.message);
       }
     }
 
@@ -722,7 +627,6 @@ app.post("/webhook", async (req, res) => {
     } else {
       await saveMessage(from, "user", text);
       history.push({ role: "user", content: text });
-
       const model = selectModel(text);
       const response = await anthropic.messages.create({
         model: model,
