@@ -343,16 +343,26 @@ async function getShopifyOrders(limit = 10) {
 }
 
 async function getShopifyProducts() {
-  const data = await shopifyRequest("GET", `/products.json?limit=250&status=any`);
-  console.log(`📦 Produits reçus: keys=${JSON.stringify(Object.keys(data))} count=${data.products?.length}`);
-  return data.products || [];
+  // 3 appels séparés car status=any bug avec cette API
+  const [active, archived, draft] = await Promise.all([
+    shopifyRequest("GET", `/products.json?limit=250&status=active`),
+    shopifyRequest("GET", `/products.json?limit=250&status=archived`),
+    shopifyRequest("GET", `/products.json?limit=250&status=draft`),
+  ]);
+  const all = [
+    ...(active.products || []),
+    ...(archived.products || []),
+    ...(draft.products || []),
+  ];
+  console.log(`📦 Produits: actifs=${active.products?.length} archivés=${archived.products?.length} brouillons=${draft.products?.length} total=${all.length}`);
+  return all;
 }
 
 async function getShopifyStats() {
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const [orders, products] = await Promise.all([
     shopifyRequest("GET", `/orders.json?limit=250&status=any&created_at_min=${since}`),
-    shopifyRequest("GET", `/products.json?limit=250&status=any`),
+    shopifyRequest("GET", `/products.json?limit=250`),
   ]);
   const totalRevenue = orders.orders
     .filter(o => o.financial_status === "paid")
