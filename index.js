@@ -724,6 +724,28 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+app.get("/test-shopify", async (req, res) => {
+  try {
+    const token = await getShopifyToken();
+    const count = await axios.get(
+      `https://${SHOPIFY_SHOP}/admin/api/2024-01/products/count.json`,
+      { headers: { "X-Shopify-Access-Token": token } }
+    );
+    const list = await axios.get(
+      `https://${SHOPIFY_SHOP}/admin/api/2024-01/products.json?limit=5`,
+      { headers: { "X-Shopify-Access-Token": token } }
+    );
+    res.json({
+      token: token.slice(0, 10) + "...",
+      shop: SHOPIFY_SHOP,
+      count: count.data,
+      first_5_products: list.data.products?.map(p => ({ id: p.id, title: p.title, status: p.status }))
+    });
+  } catch (err) {
+    res.json({ error: err.response?.data || err.message, status: err.response?.status });
+  }
+});
+
 app.get("/", (req, res) => res.send("Jarvis est en ligne ✅"));
 
 const PORT = process.env.PORT || 3000;
