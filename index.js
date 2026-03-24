@@ -344,7 +344,8 @@ async function getShopifyOrders(limit = 10) {
 
 async function getShopifyProducts() {
   const data = await shopifyRequest("GET", `/products.json?limit=250&status=any`);
-  return data.products;
+  console.log(`📦 Produits reçus: keys=${JSON.stringify(Object.keys(data))} count=${data.products?.length}`);
+  return data.products || [];
 }
 
 async function getShopifyStats() {
