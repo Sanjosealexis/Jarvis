@@ -234,20 +234,25 @@ const SHOPIFY_DODODOG = {
 };
 
 async function shopifyRequest(method, endpoint, data = null) {
-  const url = `https://${SHOPIFY_DODODOG.url}/admin/api/2024-01${endpoint}`;
-  const [clientId, clientSecret] = SHOPIFY_DODODOG.token.split(":");
-  const config = {
-    method,
-    url,
-    headers: { "Content-Type": "application/json" },
-    auth: {
-      username: clientId,
-      password: clientSecret,
-    },
-  };
-  if (data) config.data = data;
-  const response = await axios(config);
-  return response.data;
+  try {
+    const [clientId, clientSecret] = SHOPIFY_DODODOG.token.split(":");
+    const url = `https://${SHOPIFY_DODODOG.url}/admin/api/2024-01${endpoint}`;
+    console.log(`🛍️ Shopify ${method} ${url} (auth: ${clientId?.slice(0,8)}...)`);
+    const config = {
+      method,
+      url,
+      headers: { "Content-Type": "application/json" },
+      auth: { username: clientId, password: clientSecret },
+    };
+    if (data) config.data = data;
+    const response = await axios(config);
+    console.log(`✅ Shopify réponse: ${response.status}`);
+    return response.data;
+  } catch (err) {
+    const errorDetail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error(`❌ Shopify erreur: ${err.response?.status} — ${errorDetail}`);
+    throw new Error(`Shopify ${err.response?.status || 'erreur'}: ${errorDetail}`);
+  }
 }
 
 async function getShopifyOrders(limit = 10) {
@@ -278,7 +283,7 @@ async function getShopifyStats() {
 }
 
 // ═══════════════════════════════
-// SYSTÈME DE VALIDATION — DOUBLE CONFIRMATION
+// SYSTÈME DE VALIDATION
 // ═══════════════════════════════
 async function createPendingAction(phone, actionType, actionData, preview) {
   await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
@@ -310,7 +315,6 @@ async function cancelPendingAction(phone) {
 
 async function executeShopifyAction(action) {
   const data = typeof action.action_data === 'string' ? JSON.parse(action.action_data) : action.action_data;
-
   switch (action.action_type) {
     case "update_product": {
       await shopifyRequest("PUT", `/products/${data.product_id}.json`, { product: data.updates });
@@ -336,24 +340,20 @@ async function handleCommand(command, from) {
   if (cmd === "oui" || cmd === "confirmer" || cmd === "ok go" || cmd === "valider") {
     const action = await confirmPendingAction(from);
     if (action) {
-      console.log(`✅ Action confirmée: ${action.action_type}`);
-      try {
-        return await executeShopifyAction(action);
-      } catch (err) {
-        return `❌ Erreur lors de l'exécution : ${err.message}`;
-      }
+      try { return await executeShopifyAction(action); }
+      catch (err) { return `❌ Erreur : ${err.message}`; }
     }
     return null;
   }
 
   if (cmd === "non" || cmd === "annuler" || cmd === "cancel") {
     await cancelPendingAction(from);
-    return `🚫 Action annulée. Aucune modification effectuée.`;
+    return `🚫 Action annulée.`;
   }
 
   if (cmd === "/status") {
     const memory = await pool.query(`SELECT key, value, tags FROM memory ORDER BY updated_at DESC`);
-    if (memory.rows.length === 0) return "📊 *Status Jarvis*\n\nAucune donnée en mémoire pour l'instant.";
+    if (memory.rows.length === 0) return "📊 *Status Jarvis*\n\nAucune donnée en mémoire.";
     const byTag = {};
     memory.rows.forEach(r => {
       const tag = r.tags?.split(",")[0] || "general";
@@ -369,7 +369,7 @@ async function handleCommand(command, from) {
 
   if (cmd === "/memory") {
     const memory = await pool.query(`SELECT key, value, tags, updated_at FROM memory ORDER BY updated_at DESC LIMIT 30`);
-    if (memory.rows.length === 0) return "🧠 *Mémoire vide*\n\nJe n'ai encore rien mémorisé.";
+    if (memory.rows.length === 0) return "🧠 *Mémoire vide*";
     let response = `🧠 *Mémoire Jarvis (${memory.rows.length} entrées)*\n\n`;
     memory.rows.forEach(r => {
       const date = new Date(r.updated_at).toLocaleDateString("fr-FR");
@@ -380,7 +380,7 @@ async function handleCommand(command, from) {
 
   if (cmd === "/clear") {
     await pool.query(`DELETE FROM conversations WHERE user_phone = $1`, [ALLOWED_NUMBER]);
-    return "🗑️ Historique effacé. On repart de zéro !";
+    return "🗑️ Historique effacé.";
   }
 
   if (cmd === "/stats" || cmd === "/shopify") {
@@ -399,7 +399,7 @@ async function handleCommand(command, from) {
       let response = `📦 *5 dernières commandes DodoDog*\n\n`;
       orders.forEach(o => {
         const date = new Date(o.created_at).toLocaleDateString("fr-FR");
-        response += `• ${date} — ${o.total_price}€ — ${o.financial_status} — ${o.email || "sans email"}\n`;
+        response += `• ${date} — ${o.total_price}€ — ${o.financial_status}\n`;
       });
       return response.trim();
     } catch (err) {
@@ -438,7 +438,6 @@ async function handleImageMessage(req, history, systemWithMemory) {
   const mediaType = req.body.MediaContentType0;
   const caption = req.body.Body || "";
   if (!mediaType?.startsWith("image/")) return "Je ne peux traiter que des images pour l'instant.";
-
   console.log(`🖼️ Image reçue: ${mediaType}`);
   const imageResponse = await axios.get(mediaUrl, {
     responseType: "arraybuffer",
@@ -500,8 +499,8 @@ RÈGLES DE VALIDATION OBLIGATOIRES
 AVANT toute modification Shopify, tu dois TOUJOURS :
 1. PROPOSER ce que tu vas faire avec un aperçu clair
 2. Attendre la confirmation "oui" ou "confirmer" d'Alexis
-3. Pour les modifications en masse : appliquer d'abord sur 1 seul produit test, montrer le résultat, attendre "confirmer tout"
-4. Pour les actions risquées : demander une double confirmation explicite
+3. Pour les modifications en masse : appliquer sur 1 produit test d'abord, attendre "confirmer tout"
+4. Pour les actions risquées : demander une double confirmation
 Tu ne modifies JAMAIS Shopify sans confirmation explicite d'Alexis.
 
 ═══════════════════════════════
@@ -591,7 +590,6 @@ app.post("/webhook", async (req, res) => {
   console.log(`📩 Message de ${from}: ${text || "[image]"}`);
 
   try {
-    // ── COMMANDES RAPIDES + VALIDATION ──
     const cmdReply = await handleCommand(text, from);
     if (cmdReply) {
       await saveMessage(from, "user", text);
@@ -603,7 +601,6 @@ app.post("/webhook", async (req, res) => {
     const history = await getHistory(from);
     const relevantMemory = await getRelevantMemory(text);
 
-    // Injecte les données Shopify si la question concerne la boutique
     let shopifyContext = "";
     const shopifyKeywords = ["commande", "vente", "produit", "stock", "prix", "revenu", "chiffre", "boutique", "shopify"];
     if (shopifyKeywords.some(k => text.toLowerCase().includes(k))) {
@@ -643,7 +640,7 @@ app.post("/webhook", async (req, res) => {
     res.status(200).send('');
 
   } catch (err) {
-    console.error("Erreur:", err.message);
+    console.error("Erreur webhook:", err.message);
     res.status(200).send('');
   }
 });
