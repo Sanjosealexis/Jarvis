@@ -4,6 +4,7 @@ const axios = require("axios");
 const Anthropic = require("@anthropic-ai/sdk");
 const { Pool } = require("pg");
 const twilio = require("twilio");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -109,7 +110,6 @@ async function initDB() {
       id SERIAL PRIMARY KEY,
       shop VARCHAR(255) UNIQUE NOT NULL,
       access_token TEXT NOT NULL,
-      expires_at TIMESTAMP NOT NULL,
       updated_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -233,53 +233,84 @@ Si non: IGNORER`
 }
 
 // ═══════════════════════════════
-// SHOPIFY API — TOKEN AUTOMATIQUE
+// SHOPIFY OAUTH
 // ═══════════════════════════════
 const SHOPIFY_SHOP = process.env.SHOPIFY_DODODOG_URL;
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_DODODOG_CLIENT_ID;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_DODODOG_SECRET;
+const SHOPIFY_SCOPES = "read_products,write_products,read_orders,read_inventory,write_inventory,read_customers";
+const APP_URL = "https://jarvis-production-4d2f.up.railway.app";
 
-// Récupère ou renouvelle le token Shopify automatiquement
-async function getShopifyToken() {
-  // Vérifie si on a un token valide en base
-  const cached = await pool.query(
-    `SELECT access_token, expires_at FROM shopify_tokens WHERE shop = $1`,
-    [SHOPIFY_SHOP]
-  );
+// Route d'installation OAuth — redirige vers Shopify
+app.get("/auth", (req, res) => {
+  const shop = req.query.shop || SHOPIFY_SHOP;
+  const redirectUri = `${APP_URL}/auth/callback`;
+  const authUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${SHOPIFY_SCOPES}&redirect_uri=${redirectUri}`;
+  console.log(`🔐 OAuth redirect: ${authUrl}`);
+  res.redirect(authUrl);
+});
 
-  if (cached.rows.length > 0) {
-    const { access_token, expires_at } = cached.rows[0];
-    // Token encore valide (avec 5 min de marge)
-    if (new Date(expires_at) > new Date(Date.now() + 5 * 60 * 1000)) {
-      return access_token;
-    }
+// Route callback OAuth — capture le vrai token shpat_
+app.get("/auth/callback", async (req, res) => {
+  const { shop, code, hmac } = req.query;
+
+  if (!shop || !code) {
+    return res.status(400).send("Paramètres manquants");
   }
 
-  // Obtenir un nouveau token via client_credentials
-  console.log("🔑 Renouvellement token Shopify...");
-  const response = await axios.post(
-    `https://${SHOPIFY_SHOP}/admin/oauth/access_token`,
-    new URLSearchParams({
-      grant_type: "client_credentials",
+  // Vérifie le HMAC pour sécuriser
+  const params = Object.keys(req.query)
+    .filter(k => k !== "hmac")
+    .sort()
+    .map(k => `${k}=${req.query[k]}`)
+    .join("&");
+  const digest = crypto.createHmac("sha256", SHOPIFY_CLIENT_SECRET).update(params).digest("hex");
+  if (digest !== hmac) {
+    console.error("❌ HMAC invalide");
+    return res.status(403).send("HMAC invalide");
+  }
+
+  try {
+    // Échange le code contre le vrai token shpat_
+    const response = await axios.post(`https://${shop}/admin/oauth/access_token`, {
       client_id: SHOPIFY_CLIENT_ID,
       client_secret: SHOPIFY_CLIENT_SECRET,
-    }),
-    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+      code,
+    });
+
+    const { access_token } = response.data;
+    console.log(`✅ Token Shopify obtenu pour ${shop}: ${access_token.slice(0, 10)}...`);
+
+    // Sauvegarde en base
+    await pool.query(
+      `INSERT INTO shopify_tokens (shop, access_token)
+       VALUES ($1, $2)
+       ON CONFLICT (shop) DO UPDATE SET access_token = $2, updated_at = NOW()`,
+      [shop, access_token]
+    );
+
+    res.send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:50px">
+        <h1>✅ Jarvis connecté à ${shop}</h1>
+        <p>L'accès Shopify est configuré. Tu peux fermer cette page.</p>
+      </body></html>
+    `);
+  } catch (err) {
+    console.error("❌ Erreur OAuth callback:", err.message);
+    res.status(500).send("Erreur lors de l'obtention du token");
+  }
+});
+
+// Récupère le token depuis la base
+async function getShopifyToken() {
+  const result = await pool.query(
+    `SELECT access_token FROM shopify_tokens WHERE shop = $1`,
+    [SHOPIFY_SHOP]
   );
-
-  const { access_token, expires_in } = response.data;
-  const expiresAt = new Date(Date.now() + (expires_in || 86399) * 1000);
-
-  // Sauvegarde en base
-  await pool.query(
-    `INSERT INTO shopify_tokens (shop, access_token, expires_at)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (shop) DO UPDATE SET access_token = $2, expires_at = $3, updated_at = NOW()`,
-    [SHOPIFY_SHOP, access_token, expiresAt]
-  );
-
-  console.log(`✅ Token Shopify obtenu, expire le ${expiresAt.toISOString()}`);
-  return access_token;
+  if (result.rows.length === 0) {
+    throw new Error(`Pas de token Shopify. Installe l'app via: ${APP_URL}/auth`);
+  }
+  return result.rows[0].access_token;
 }
 
 async function shopifyRequest(method, endpoint, data = null) {
@@ -330,21 +361,14 @@ async function getShopifyStats() {
     revenue_30j: totalRevenue.toFixed(2),
     products_total: products.products.length,
     products_active: products.products.filter(p => p.status === "active").length,
+    products_archived: products.products.filter(p => p.status === "archived").length,
+    products_draft: products.products.filter(p => p.status === "draft").length,
   };
 }
 
 // ═══════════════════════════════
 // SYSTÈME DE VALIDATION
 // ═══════════════════════════════
-async function createPendingAction(phone, actionType, actionData, preview) {
-  await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
-  const result = await pool.query(
-    `INSERT INTO pending_actions (user_phone, action_type, action_data, preview) VALUES ($1, $2, $3, $4) RETURNING id`,
-    [phone, actionType, JSON.stringify(actionData), preview]
-  );
-  return result.rows[0].id;
-}
-
 async function getPendingAction(phone) {
   const result = await pool.query(
     `SELECT * FROM pending_actions WHERE user_phone = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1`,
@@ -437,7 +461,7 @@ async function handleCommand(command, from) {
   if (cmd === "/stats" || cmd === "/shopify") {
     try {
       const stats = await getShopifyStats();
-      return `📊 *DodoDog — Stats 30 jours*\n\n• Commandes : ${stats.orders_30j}\n• Revenus : ${stats.revenue_30j}€\n• Produits actifs : ${stats.products_active}/${stats.products_total}`;
+      return `📊 *DodoDog — Stats 30 jours*\n\n• Commandes : ${stats.orders_30j}\n• Revenus : ${stats.revenue_30j}€\n• Produits actifs : ${stats.products_active}\n• Produits archivés : ${stats.products_archived}\n• Brouillons : ${stats.products_draft}\n• Total : ${stats.products_total}`;
     } catch (err) {
       return `❌ Erreur Shopify : ${err.message}`;
     }
@@ -463,7 +487,8 @@ async function handleCommand(command, from) {
       const products = await getShopifyProducts();
       let response = `🛍️ *Produits DodoDog (${products.length})*\n\n`;
       products.slice(0, 15).forEach(p => {
-        response += `• ${p.title} — ${p.status} — ${p.variants[0]?.price}€\n`;
+        const statusIcon = p.status === "active" ? "✅" : p.status === "archived" ? "📦" : "📝";
+        response += `${statusIcon} ${p.title} — ${p.variants[0]?.price}€\n`;
       });
       if (products.length > 15) response += `\n_...et ${products.length - 15} autres_`;
       return response.trim();
@@ -640,13 +665,16 @@ app.post("/webhook", async (req, res) => {
   if (isUrgent(text)) console.log(`🚨 URGENCE détectée: ${text}`);
   console.log(`📩 Message de ${from}: ${text || "[image]"}`);
 
+  // Accusé de réception immédiat pour les messages longs à traiter
+  res.status(200).send('');
+
   try {
     const cmdReply = await handleCommand(text, from);
     if (cmdReply) {
       await saveMessage(from, "user", text);
       await saveMessage(from, "assistant", cmdReply);
       await sendWhatsApp(from, cmdReply);
-      return res.status(200).send('');
+      return;
     }
 
     const history = await getHistory(from);
@@ -657,7 +685,7 @@ app.post("/webhook", async (req, res) => {
     if (shopifyKeywords.some(k => text.toLowerCase().includes(k))) {
       try {
         const stats = await getShopifyStats();
-        shopifyContext = `\n\n═══════════════════════════════\nDONNÉES SHOPIFY DODODOG EN TEMPS RÉEL\n═══════════════════════════════\nCommandes (30j): ${stats.orders_30j}\nRevenu (30j): ${stats.revenue_30j}€\nProduits actifs: ${stats.products_active}/${stats.products_total}`;
+        shopifyContext = `\n\n═══════════════════════════════\nDONNÉES SHOPIFY DODODOG EN TEMPS RÉEL\n═══════════════════════════════\nCommandes (30j): ${stats.orders_30j}\nRevenu (30j): ${stats.revenue_30j}€\nProduits actifs: ${stats.products_active} | Archivés: ${stats.products_archived} | Brouillons: ${stats.products_draft}`;
       } catch (err) {
         console.error("Erreur stats Shopify:", err.message);
       }
@@ -688,11 +716,10 @@ app.post("/webhook", async (req, res) => {
     await saveMessage(from, "assistant", reply);
     detectAndSaveMemory(text, reply).catch(err => console.error("Mémoire auto:", err.message));
     await sendWhatsApp(from, reply);
-    res.status(200).send('');
 
   } catch (err) {
     console.error("Erreur webhook:", err.message);
-    res.status(200).send('');
+    await sendWhatsApp(from, `❌ Erreur : ${err.message}`).catch(() => {});
   }
 });
 
@@ -702,4 +729,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   await initDB();
   console.log(`Jarvis démarré sur le port ${PORT}`);
+  console.log(`Pour connecter Shopify: ${APP_URL}/auth`);
 });
