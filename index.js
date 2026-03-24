@@ -312,7 +312,7 @@ async function getShopifyOrders(limit = 10) {
 }
 
 async function getShopifyProducts() {
-  const data = await shopifyRequest("GET", `/products.json?limit=250`);
+  const data = await shopifyRequest("GET", `/products.json?limit=250&status=any`);
   return data.products;
 }
 
@@ -320,7 +320,7 @@ async function getShopifyStats() {
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const [orders, products] = await Promise.all([
     shopifyRequest("GET", `/orders.json?limit=250&status=any&created_at_min=${since}`),
-    shopifyRequest("GET", `/products.json?limit=250`),
+    shopifyRequest("GET", `/products.json?limit=250&status=any`),
   ]);
   const totalRevenue = orders.orders
     .filter(o => o.financial_status === "paid")
