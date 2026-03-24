@@ -43,37 +43,27 @@ function isUrgent(text) {
 
 function selectModel(text) {
   const t = text.toLowerCase();
-
-  // Urgence → toujours Sonnet
   if (isUrgent(text)) {
     console.log(`🚨 Modèle: Sonnet (URGENT)`);
     return MODEL_SONNET;
   }
-
   const sonnetTriggers = [
     "analyse", "analyser", "analysons",
     "stratégie", "stratégique",
     "rédige", "rédiger", "écris", "propose",
     "optimise", "optimiser",
     "campagne", "performance", "résultat",
-    "plan", "planning",
-    "compare", "comparaison",
-    "explique", "comment faire",
-    "aide moi à",
-    "diagnostic", "problème",
-    "améliore", "améliorer",
-    "crée", "créer", "génère",
-    "rapport", "bilan",
+    "plan", "planning", "compare", "comparaison",
+    "explique", "comment faire", "aide moi à",
+    "diagnostic", "problème", "améliore", "améliorer",
+    "crée", "créer", "génère", "rapport", "bilan",
     "description produit", "fiche produit",
-    "email", "mail",
-    "pourquoi", "comment se fait"
+    "email", "mail", "pourquoi", "comment se fait"
   ];
-
   if (sonnetTriggers.some(trigger => t.includes(trigger))) {
     console.log(`🧠 Modèle: Sonnet (tâche complexe)`);
     return MODEL_SONNET;
   }
-
   console.log(`⚡ Modèle: Haiku (message simple)`);
   return MODEL_HAIKU;
 }
@@ -104,6 +94,15 @@ async function initDB() {
     );
     CREATE TABLE IF NOT EXISTS processed_messages (
       message_sid VARCHAR(100) PRIMARY KEY,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS pending_actions (
+      id SERIAL PRIMARY KEY,
+      user_phone VARCHAR(50) NOT NULL,
+      action_type VARCHAR(100) NOT NULL,
+      action_data JSONB NOT NULL,
+      preview TEXT NOT NULL,
+      status VARCHAR(20) DEFAULT 'pending',
       created_at TIMESTAMP DEFAULT NOW()
     );
   `);
@@ -227,16 +226,195 @@ Si non: IGNORER`
 }
 
 // ═══════════════════════════════
+// SHOPIFY API — DODODOG
+// ═══════════════════════════════
+const SHOPIFY_DODODOG = {
+  url: process.env.SHOPIFY_DODODOG_URL,
+  token: process.env.SHOPIFY_DODODOG_TOKEN,
+};
+
+async function shopifyRequest(method, endpoint, data = null) {
+  const url = `https://${SHOPIFY_DODODOG.url}/admin/api/2024-01${endpoint}`;
+  const config = {
+    method,
+    url,
+    headers: {
+      "X-Shopify-Access-Token": SHOPIFY_DODODOG.token,
+      "Content-Type": "application/json",
+    },
+  };
+  if (data) config.data = data;
+  const response = await axios(config);
+  return response.data;
+}
+
+// Lecture
+async function getShopifyOrders(limit = 10) {
+  const data = await shopifyRequest("GET", `/orders.json?limit=${limit}&status=any`);
+  return data.orders;
+}
+
+async function getShopifyProducts() {
+  const data = await shopifyRequest("GET", `/products.json?limit=250`);
+  return data.products;
+}
+
+async function getShopifyStats() {
+  const [orders, products] = await Promise.all([
+    shopifyRequest("GET", `/orders.json?limit=50&status=any&created_at_min=${new Date(Date.now() - 30*24*60*60*1000).toISOString()}`),
+    shopifyRequest("GET", `/products.json?limit=250`),
+  ]);
+
+  const totalRevenue = orders.orders
+    .filter(o => o.financial_status === "paid")
+    .reduce((sum, o) => sum + parseFloat(o.total_price), 0);
+
+  return {
+    orders_30j: orders.orders.length,
+    revenue_30j: totalRevenue.toFixed(2),
+    products_total: products.products.length,
+    products_active: products.products.filter(p => p.status === "active").length,
+  };
+}
+
+// ═══════════════════════════════
+// SYSTÈME DE VALIDATION — DOUBLE CONFIRMATION
+// ═══════════════════════════════
+
+// Sauvegarde une action en attente et retourne un aperçu pour validation
+async function createPendingAction(phone, actionType, actionData, preview) {
+  // Annule toute action en attente précédente
+  await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
+
+  const result = await pool.query(
+    `INSERT INTO pending_actions (user_phone, action_type, action_data, preview) VALUES ($1, $2, $3, $4) RETURNING id`,
+    [phone, actionType, JSON.stringify(actionData), preview]
+  );
+  return result.rows[0].id;
+}
+
+async function getPendingAction(phone) {
+  const result = await pool.query(
+    `SELECT * FROM pending_actions WHERE user_phone = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1`,
+    [phone]
+  );
+  return result.rows[0] || null;
+}
+
+async function confirmPendingAction(phone) {
+  const action = await getPendingAction(phone);
+  if (!action) return null;
+
+  await pool.query(`UPDATE pending_actions SET status = 'confirmed' WHERE id = $1`, [action.id]);
+  return action;
+}
+
+async function cancelPendingAction(phone) {
+  await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
+}
+
+// Exécute une action Shopify confirmée
+async function executeShopifyAction(action) {
+  const data = action.action_data;
+
+  switch (action.action_type) {
+
+    case "update_product": {
+      await shopifyRequest("PUT", `/products/${data.product_id}.json`, {
+        product: data.updates
+      });
+      return `✅ Produit mis à jour avec succès.`;
+    }
+
+    case "update_price": {
+      await shopifyRequest("PUT", `/variants/${data.variant_id}.json`, {
+        variant: { id: data.variant_id, price: data.new_price }
+      });
+      return `✅ Prix mis à jour : ${data.new_price}€`;
+    }
+
+    case "bulk_update_first": {
+      // Applique la modification sur le premier produit uniquement pour validation
+      const product = data.products[0];
+      await shopifyRequest("PUT", `/products/${product.id}.json`, {
+        product: data.build_update(product)
+      });
+      return `✅ *Test appliqué sur 1 produit* : "${product.title}"\n\nVérifie sur Shopify que le résultat est correct.\nSi c'est bon, réponds *"confirmer tout"* pour appliquer aux ${data.products.length - 1} autres produits.\nSi ce n'est pas bon, réponds *"annuler"*.`;
+    }
+
+    case "bulk_update_all": {
+      // Applique sur tous les produits restants (sauf le premier déjà fait)
+      const products = data.products.slice(1);
+      let success = 0;
+      for (const product of products) {
+        try {
+          await shopifyRequest("PUT", `/products/${product.id}.json`, {
+            product: data.build_update(product)
+          });
+          success++;
+          // Pause pour éviter le rate limit Shopify
+          await new Promise(r => setTimeout(r, 500));
+        } catch (err) {
+          console.error(`Erreur produit ${product.id}:`, err.message);
+        }
+      }
+      return `✅ *Modification en masse terminée*\n\n• ${success}/${products.length} produits mis à jour avec succès.`;
+    }
+
+    default:
+      return `❌ Action inconnue : ${action.action_type}`;
+  }
+}
+
+// ═══════════════════════════════
 // COMMANDES RAPIDES
 // ═══════════════════════════════
-async function handleCommand(command) {
+async function handleCommand(command, from) {
   const cmd = command.trim().toLowerCase();
+
+  // Confirmation d'une action en attente
+  if (cmd === "oui" || cmd === "confirmer" || cmd === "ok go" || cmd === "valider") {
+    const action = await confirmPendingAction(from);
+    if (action) {
+      console.log(`✅ Action confirmée: ${action.action_type}`);
+      try {
+        const result = await executeShopifyAction(action);
+        return result;
+      } catch (err) {
+        return `❌ Erreur lors de l'exécution : ${err.message}`;
+      }
+    }
+  }
+
+  // Confirmation finale pour les modifications en masse
+  if (cmd === "confirmer tout" || cmd === "oui tout" || cmd === "go tout") {
+    const action = await getPendingAction(from);
+    if (action && action.action_type === "bulk_update_first") {
+      await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE id = $1`, [action.id]);
+      // Crée une nouvelle action pour le reste
+      const bulkAllAction = {
+        ...action,
+        action_type: "bulk_update_all",
+        action_data: action.action_data,
+      };
+      try {
+        const result = await executeShopifyAction(bulkAllAction);
+        return result;
+      } catch (err) {
+        return `❌ Erreur : ${err.message}`;
+      }
+    }
+  }
+
+  // Annulation
+  if (cmd === "non" || cmd === "annuler" || cmd === "cancel") {
+    await cancelPendingAction(from);
+    return `🚫 Action annulée. Aucune modification effectuée.`;
+  }
 
   if (cmd === "/status") {
     const memory = await pool.query(`SELECT key, value, tags FROM memory ORDER BY updated_at DESC`);
-    if (memory.rows.length === 0) {
-      return "📊 *Status Jarvis*\n\nAucune donnée en mémoire pour l'instant.";
-    }
+    if (memory.rows.length === 0) return "📊 *Status Jarvis*\n\nAucune donnée en mémoire pour l'instant.";
     const byTag = {};
     memory.rows.forEach(r => {
       const tag = r.tags?.split(",")[0] || "general";
@@ -263,11 +441,49 @@ async function handleCommand(command) {
 
   if (cmd === "/clear") {
     await pool.query(`DELETE FROM conversations WHERE user_phone = $1`, [ALLOWED_NUMBER]);
-    return "🗑️ Historique de conversation effacé. On repart de zéro !";
+    return "🗑️ Historique effacé. On repart de zéro !";
+  }
+
+  if (cmd === "/shopify" || cmd === "/stats") {
+    try {
+      const stats = await getShopifyStats();
+      return `📊 *DodoDog — Stats 30 jours*\n\n• Commandes : ${stats.orders_30j}\n• Revenus : ${stats.revenue_30j}€\n• Produits actifs : ${stats.products_active}/${stats.products_total}`;
+    } catch (err) {
+      return `❌ Erreur Shopify : ${err.message}`;
+    }
+  }
+
+  if (cmd === "/commandes") {
+    try {
+      const orders = await getShopifyOrders(5);
+      if (orders.length === 0) return "📦 Aucune commande récente.";
+      let response = `📦 *5 dernières commandes DodoDog*\n\n`;
+      orders.forEach(o => {
+        const date = new Date(o.created_at).toLocaleDateString("fr-FR");
+        response += `• ${date} — ${o.total_price}€ — ${o.financial_status} — ${o.email || "sans email"}\n`;
+      });
+      return response.trim();
+    } catch (err) {
+      return `❌ Erreur Shopify : ${err.message}`;
+    }
+  }
+
+  if (cmd === "/produits") {
+    try {
+      const products = await getShopifyProducts();
+      let response = `🛍️ *Produits DodoDog (${products.length})*\n\n`;
+      products.slice(0, 15).forEach(p => {
+        response += `• ${p.title} — ${p.status} — ${p.variants[0]?.price}€\n`;
+      });
+      if (products.length > 15) response += `\n_...et ${products.length - 15} autres_`;
+      return response.trim();
+    } catch (err) {
+      return `❌ Erreur Shopify : ${err.message}`;
+    }
   }
 
   if (cmd === "/help") {
-    return `🤖 *Commandes Jarvis*\n\n/status — résumé de toutes tes boutiques\n/memory — tout ce que j'ai en mémoire\n/clear — efface l'historique de conversation\n/help — cette aide\n\nTu peux aussi m'envoyer des 📸 photos pour que je les analyse !`;
+    return `🤖 *Commandes Jarvis*\n\n*Info*\n/stats — stats DodoDog 30 jours\n/commandes — 5 dernières commandes\n/produits — liste des produits\n/status — mémoire par boutique\n/memory — tout ce que je sais\n\n*Gestion*\n/clear — efface l'historique\n\n*Validation*\noui / confirmer — valide une action\nnon / annuler — annule une action\nconfirmer tout — applique en masse\n\nTu peux aussi m'envoyer des 📸 photos !`;
   }
 
   return null;
@@ -303,14 +519,8 @@ async function handleImageMessage(req, history, systemWithMemory) {
   const userMessage = {
     role: "user",
     content: [
-      {
-        type: "image",
-        source: { type: "base64", media_type: mediaType, data: base64Image },
-      },
-      {
-        type: "text",
-        text: caption || "Analyse cette image et dis-moi ce que tu vois en lien avec mon business.",
-      },
+      { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
+      { type: "text", text: caption || "Analyse cette image et dis-moi ce que tu vois en lien avec mon business." },
     ],
   };
 
@@ -329,19 +539,27 @@ async function handleImageMessage(req, history, systemWithMemory) {
 // ENVOI WHATSAPP
 // ═══════════════════════════════
 async function sendWhatsApp(to, body) {
+  // WhatsApp limite les messages à 1600 caractères
+  const maxLength = 1600;
+  if (body.length > maxLength) {
+    const parts = [];
+    for (let i = 0; i < body.length; i += maxLength) {
+      parts.push(body.slice(i, i + maxLength));
+    }
+    for (const part of parts) {
+      await axios.post(
+        `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
+        new URLSearchParams({ From: `whatsapp:${process.env.TWILIO_NUMBER}`, To: to, Body: part }),
+        { auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN } }
+      );
+      await new Promise(r => setTimeout(r, 500));
+    }
+    return;
+  }
   await axios.post(
     `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
-    new URLSearchParams({
-      From: `whatsapp:${process.env.TWILIO_NUMBER}`,
-      To: to,
-      Body: body,
-    }),
-    {
-      auth: {
-        username: process.env.TWILIO_SID,
-        password: process.env.TWILIO_TOKEN,
-      },
-    }
+    new URLSearchParams({ From: `whatsapp:${process.env.TWILIO_NUMBER}`, To: to, Body: body }),
+    { auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN } }
   );
 }
 
@@ -350,15 +568,24 @@ async function sendWhatsApp(to, body) {
 // ═══════════════════════════════
 const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant personnel IA d'Alexis San Jose, entrepreneur e-commerce basé en Gironde, France. Tu gères tout son business de A à Z. Tu es son bras droit opérationnel.
 
+Tu as accès à l'API Shopify de DodoDog en lecture et en écriture.
+
 ═══════════════════════════════
-FORMATAGE WHATSAPP — RÈGLES OBLIGATOIRES
+RÈGLES DE VALIDATION OBLIGATOIRES
 ═══════════════════════════════
-- Titres et mots importants : *texte en gras*
-- Sous-titres ou emphase : _texte en italique_
-- Listes : commence chaque item par • ou un chiffre
-- Séparations : utilise des lignes vides entre les sections
-- Émojis : utilise-les avec parcimonie pour structurer (✅ ⚠️ 📊 💡 🚨)
-- Jamais de markdown classique (# ## **) — uniquement le formatage WhatsApp natif
+AVANT toute modification Shopify, tu dois TOUJOURS :
+
+1. PROPOSER ce que tu vas faire avec un aperçu clair
+2. Attendre la confirmation "oui" ou "confirmer" d'Alexis
+3. Pour les modifications en masse (plusieurs produits) :
+   - Appliquer d'abord sur 1 seul produit test
+   - Montrer le résultat et demander validation
+   - Attendre "confirmer tout" avant d'appliquer aux autres
+4. Pour les actions risquées (suppression, changement de prix en masse) :
+   - Demander une double confirmation explicite
+   - Rappeler ce qui va être modifié
+
+Tu ne modifies JAMAIS Shopify sans confirmation explicite d'Alexis.
 
 ═══════════════════════════════
 BOUTIQUE 1 — DODODOG (dododog.fr)
@@ -382,8 +609,6 @@ Boutique Etsy : DodoDogFR
 BOUTIQUE 2 — VERANO LUMIÈRE PARIS (veranolumiereparis.fr)
 ═══════════════════════════════
 Niche : luminaires design, marché français premium
-Catalogue : Lustres, Suspensions, Plafonniers, Appliques Murales, Lampadaires, Lampes de Table
-Styles : Moderne, Scandinave, Industriel, Minimaliste, Vintage — Matières : Bois, Métal, Verre, Rotin
 Statut : rouvert récemment, GMC 360 fiches en stock limité en attente de validation
 Charte graphique : bronze #A8815C, fond blanc #FFFFFF, minimaliste luxe
 
@@ -400,7 +625,7 @@ Statut : en construction, niche bébé/poussette, marché français
 ═══════════════════════════════
 OUTILS
 ═══════════════════════════════
-Shopify, Google Ads, GMC, Simprosys, DSers, Nano Banana Pro 2
+Shopify (accès API DodoDog actif), Google Ads, GMC, Simprosys, DSers, Nano Banana Pro 2
 
 ═══════════════════════════════
 RÈGLES ABSOLUES
@@ -445,36 +670,56 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).send('');
   }
 
-  // Détection urgence
-  if (isUrgent(text)) {
-    console.log(`🚨 URGENCE détectée: ${text}`);
-  }
-
+  if (isUrgent(text)) console.log(`🚨 URGENCE détectée: ${text}`);
   console.log(`📩 Message de ${from}: ${text || "[image]"}`);
 
   try {
-    // ── COMMANDES RAPIDES ──
-    if (text.startsWith("/")) {
-      const commandReply = await handleCommand(text);
-      if (commandReply) {
-        await sendWhatsApp(from, commandReply);
+    // ── COMMANDES RAPIDES + VALIDATION ──
+    const cmdReply = await handleCommand(text, from);
+    if (cmdReply) {
+      await saveMessage(from, "user", text);
+      await saveMessage(from, "assistant", cmdReply);
+      await sendWhatsApp(from, cmdReply);
+      return res.status(200).send('');
+    }
+
+    // ── VÉRIFICATION ACTION EN ATTENTE ──
+    // Si une action est en attente et que le message ressemble à une confirmation/annulation
+    const pendingAction = await getPendingAction(from);
+    const lowerText = text.toLowerCase().trim();
+    if (pendingAction && (lowerText === "oui" || lowerText === "non" || lowerText === "confirmer" || lowerText === "annuler")) {
+      const cmdReply2 = await handleCommand(text, from);
+      if (cmdReply2) {
+        await sendWhatsApp(from, cmdReply2);
         return res.status(200).send('');
       }
     }
 
     const history = await getHistory(from);
     const relevantMemory = await getRelevantMemory(text);
+
+    // Injecte les données Shopify si la question concerne la boutique
+    let shopifyContext = "";
+    const shopifyKeywords = ["commande", "vente", "produit", "stock", "prix", "revenue", "chiffre", "boutique", "shopify"];
+    if (shopifyKeywords.some(k => text.toLowerCase().includes(k))) {
+      try {
+        const stats = await getShopifyStats();
+        shopifyContext = `\n\n═══════════════════════════════\nDONNÉES SHOPIFY DODODOG EN TEMPS RÉEL\n═══════════════════════════════\nCommandes (30j): ${stats.orders_30j}\nRevenu (30j): ${stats.revenue_30j}€\nProduits actifs: ${stats.products_active}/${stats.products_total}`;
+      } catch (err) {
+        console.error("Erreur récupération stats Shopify:", err.message);
+      }
+    }
+
     const systemWithMemory = JARVIS_SYSTEM +
-      (relevantMemory ? `\n\n═══════════════════════════════\nMÉMOIRE PERTINENTE\n═══════════════════════════════\n${relevantMemory}` : "");
+      (relevantMemory ? `\n\n═══════════════════════════════\nMÉMOIRE PERTINENTE\n═══════════════════════════════\n${relevantMemory}` : "") +
+      shopifyContext;
 
     let reply;
 
-    // ── IMAGE ──
     if (numMedia > 0) {
       await saveMessage(from, "user", `[Image envoyée] ${text}`);
       reply = await handleImageMessage(req, history, systemWithMemory);
     } else {
-      // ── MESSAGE TEXTE ──
       await saveMessage(from, "user", text);
       history.push({ role: "user", content: text });
 
