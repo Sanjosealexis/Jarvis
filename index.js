@@ -274,29 +274,45 @@ async function cancelAction(phone) {
 }
 
 // Détecte le bloc ACTION dans la réponse de Claude
-// Supporte les JSON complexes avec guillemets imbriqués
+// Format robuste : [ACTION_START]...JSON...[ACTION_END]
 async function processShopifyAction(reply, from) {
-  // Cherche [ACTION:type:id: suivi d'un JSON jusqu'à la dernière accolade fermante avant ]
+  // Nouveau format robuste
+  const newMatch = reply.match(/\[ACTION_START\]([\s\S]*?)\[ACTION_END\]/);
+  if (newMatch) {
+    let actionData;
+    try {
+      actionData = JSON.parse(newMatch[1].trim());
+    } catch (err) {
+      console.error("Erreur parsing action:", err.message);
+      return null;
+    }
+    const { type: actionType, id, updates } = actionData;
+    if (!actionType || !id || !updates) return null;
+
+    const previewParts = [];
+    if (updates.title) previewParts.push(`titre: "${updates.title}"`);
+    if (updates.body_html) previewParts.push(`description mise à jour`);
+    if (updates.seo_title) previewParts.push(`SEO titre: "${updates.seo_title}"`);
+    if (updates.seo_description) previewParts.push(`SEO desc mise à jour`);
+    if (updates.price) previewParts.push(`prix: ${updates.price}€`);
+
+    const preview = `Modifier #${id} → ${previewParts.join(" | ") || JSON.stringify(updates)}`;
+    await savePendingAction(from, actionType, id, updates, preview);
+    return preview;
+  }
+
+  // Ancien format fallback
   const match = reply.match(/\[ACTION:(update_product|update_price):(\d+):([\s\S]*?)\](?=\s|$)/);
   if (!match) return null;
-
   const [, actionType, id, dataStr] = match;
   let updates;
   try {
     updates = JSON.parse(dataStr.trim());
   } catch (err) {
-    console.error("Erreur parsing action JSON:", dataStr, err.message);
+    console.error("Erreur parsing action JSON (ancien format):", err.message);
     return null;
   }
-
-  const previewParts = [];
-  if (updates.title) previewParts.push(`titre: "${updates.title}"`);
-  if (updates.body_html) previewParts.push(`description: ${updates.body_html.slice(0, 50)}...`);
-  if (updates.seo_title) previewParts.push(`SEO titre: "${updates.seo_title}"`);
-  if (updates.seo_description) previewParts.push(`SEO desc: "${updates.seo_description.slice(0, 50)}..."`);
-  if (updates.price) previewParts.push(`prix: ${updates.price}€`);
-
-  const preview = `Modifier produit #${id} → ${previewParts.join(" | ") || JSON.stringify(updates)}`;
+  const preview = `Modifier #${id} → ${JSON.stringify(updates).slice(0, 80)}`;
   await savePendingAction(from, actionType, id, updates, preview);
   return preview;
 }
@@ -428,29 +444,35 @@ COMMENT MODIFIER UN PRODUIT SHOPIFY
 ═══════════════════════════════
 Utilise les IDs exacts fournis dans les données produits injectées dans ce contexte.
 
-FORMAT DU BLOC ACTION (JSON valide obligatoire) :
-[ACTION:update_product:PRODUCT_ID:{"title":"nouveau titre","body_html":"<p>description</p>","seo_title":"titre SEO","seo_description":"description SEO"}]
+FORMAT DU BLOC ACTION — utilise ce format EXACT :
+[ACTION_START]
+{"type":"update_product","id":"PRODUCT_ID","updates":{"title":"nouveau titre","body_html":"<p>description html</p>","seo_title":"titre SEO","seo_description":"description SEO"}}
+[ACTION_END]
 
 Pour modifier uniquement le prix (utilise le VARIANT_ID) :
-[ACTION:update_price:VARIANT_ID:{"price":"35.00"}]
+[ACTION_START]
+{"type":"update_price","id":"VARIANT_ID","updates":{"price":"35.00"}}
+[ACTION_END]
 
-CHAMPS DISPONIBLES pour update_product :
+CHAMPS DISPONIBLES dans "updates" :
 - title : titre du produit
-- body_html : description (HTML autorisé, ex: <p>texte</p>)
-- seo_title : titre SEO (balise meta title)
-- seo_description : description SEO (balise meta description)
-- status : "active", "archived", "draft"
+- body_html : description HTML (utilise des balises <p>, <strong>, <br>, <ul><li>)
+- seo_title : balise meta title pour Google
+- seo_description : balise meta description pour Google
+- status : "active", "archived" ou "draft"
 
 RÈGLES ABSOLUES :
 1. Proposer la modification avec aperçu AVANT le bloc ACTION
-2. Le bloc ACTION est intercepté automatiquement — invisible pour Alexis
-3. Utiliser EXACTEMENT les IDs fournis — ne jamais inventer un ID
-4. JSON strictement valide — pas de virgule finale, guillemets doubles uniquement
-5. Si plusieurs modifications → un seul bloc ACTION avec tous les champs
+2. Le bloc [ACTION_START]...[ACTION_END] est intercepté automatiquement — invisible pour Alexis
+3. Utiliser EXACTEMENT les IDs fournis dans les données produits
+4. JSON strictement valide — guillemets doubles, pas de virgule finale
+5. Plusieurs modifications dans un seul bloc ACTION
 
 Exemple correct :
-"Je vais modifier le titre, la description et le SEO de ce produit. Tu confirmes ?
-[ACTION:update_product:9876543210:{"title":"Nouveau titre","body_html":"<p>Nouvelle description.</p>","seo_title":"Titre SEO optimisé","seo_description":"Description SEO optimisée pour Google"}]"
+"Je vais optimiser ce produit. Tu confirmes ?
+[ACTION_START]
+{"type":"update_product","id":"9876543210","updates":{"title":"Panier Sofa Ultra-Doux pour Chien","body_html":"<p><strong>Le compagnon idéal</strong> de votre chien.</p>","seo_title":"Panier Sofa Chien | Doux & Confortable","seo_description":"Panier sofa ultra-doux pour chien. Livraison rapide. Satisfaction garantie."}}
+[ACTION_END]"
 
 ═══════════════════════════════
 BOUTIQUE 1 — DODODOG (dododog.fr)
@@ -573,7 +595,7 @@ ${productList}`;
     await processShopifyAction(reply, from);
 
     // Nettoie le bloc [ACTION:...] avant envoi
-    const cleanReply = reply.replace(/\[ACTION:[\s\S]*?\](?=\s|$)/g, "").trim();
+    const cleanReply = reply.replace(/\[ACTION_START\][\s\S]*?\[ACTION_END\]/g, "").replace(/\[ACTION:[\s\S]*?\](?=\s|$)/g, "").trim();
     await saveMessage(from, "assistant", cleanReply);
 
     // Mémoire manuelle uniquement
