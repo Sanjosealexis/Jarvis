@@ -341,7 +341,11 @@ async function processShopifyAction(reply, from) {
 async function handleCommand(command, from) {
   const cmd = command.trim().toLowerCase();
 
-  if (["oui", "confirmer", "ok go", "valider", "yes"].some(w => cmd.includes(w))) {
+  // Confirmation — mot exact ou phrase commençant par oui/yes
+  const isConfirm = cmd === "oui" || cmd === "yes" || cmd === "confirmer" || 
+    cmd === "ok go" || cmd === "valider" || cmd === "ok" ||
+    cmd.startsWith("oui ") || cmd.startsWith("yes ");
+  if (isConfirm) {
     try {
       const result = await confirmAction(from);
       if (result) return result;
@@ -349,7 +353,9 @@ async function handleCommand(command, from) {
     return null;
   }
 
-  if (["non", "annuler", "cancel", "no"].some(w => cmd.includes(w))) {
+  // Annulation — mot exact uniquement
+  const isCancel = cmd === "non" || cmd === "no" || cmd === "annuler" || cmd === "cancel";
+  if (isCancel) {
     await cancelAction(from);
     return `🚫 Action annulée.`;
   }
