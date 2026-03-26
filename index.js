@@ -205,16 +205,30 @@ async function getShopifyStats() {
   };
 }
 
-// Exécute une modification Shopify directement
+// Exécute une modification Shopify avec vérification de l'ID
 async function executeShopifyModification(actionType, id, updates) {
+  const numId = parseInt(id);
+  if (isNaN(numId)) throw new Error(`ID invalide: ${id}`);
+
   if (actionType === "update_product") {
-    await shopifyRequest("PUT", `/products/${id}.json`, { product: { id: parseInt(id), ...updates } });
+    // Vérifie que le produit existe
+    try {
+      await shopifyRequest("GET", `/products/${numId}.json`);
+    } catch {
+      // Essaie de trouver le produit par correspondance dans les produits existants
+      const products = await getShopifyProducts();
+      const found = products.find(p => p.id === numId || String(p.id) === String(id));
+      if (!found) throw new Error(`Produit ID ${numId} introuvable. Utilise /produits pour voir les vrais IDs.`);
+    }
+    await shopifyRequest("PUT", `/products/${numId}.json`, { product: { id: numId, ...updates } });
     return `✅ Produit modifié avec succès.`;
   }
+
   if (actionType === "update_price") {
-    await shopifyRequest("PUT", `/variants/${id}.json`, { variant: { id: parseInt(id), price: updates.price } });
+    await shopifyRequest("PUT", `/variants/${numId}.json`, { variant: { id: numId, price: String(updates.price) } });
     return `✅ Prix mis à jour : ${updates.price}€`;
   }
+
   throw new Error("Action inconnue");
 }
 
@@ -227,6 +241,7 @@ async function savePendingAction(phone, actionType, id, updates, preview) {
     `INSERT INTO pending_actions (user_phone, action_type, action_data, preview) VALUES ($1, $2, $3, $4)`,
     [phone, actionType, JSON.stringify({ id, updates }), preview]
   );
+  console.log(`⏳ Action en attente: ${preview}`);
 }
 
 async function confirmAction(phone) {
@@ -240,6 +255,20 @@ async function confirmAction(phone) {
 
 async function cancelAction(phone) {
   await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
+}
+
+// Détecte le bloc [ACTION:...] dans la réponse de Claude
+async function processShopifyAction(reply, from) {
+  const match = reply.match(/\[ACTION:(update_product|update_price):(\d+):(\{[^}]+\})\]/);
+  if (!match) return null;
+  const [, actionType, id, dataStr] = match;
+  let updates;
+  try { updates = JSON.parse(dataStr); } catch { return null; }
+  const preview = actionType === "update_price"
+    ? `Modifier prix variant #${id} → ${updates.price}€`
+    : `Modifier produit #${id} → ${JSON.stringify(updates)}`;
+  await savePendingAction(from, actionType, id, updates, preview);
+  return preview;
 }
 
 // ═══════════════════════════════
@@ -272,7 +301,9 @@ async function handleCommand(command, from) {
     try {
       const orders = await getShopifyOrders(5);
       if (!orders.length) return "📦 Aucune commande récente.";
-      return `📦 *5 dernières commandes*\n\n` + orders.map(o => `• ${new Date(o.created_at).toLocaleDateString("fr-FR")} — ${o.total_price}€ — ${o.financial_status}`).join("\n");
+      return `📦 *5 dernières commandes*\n\n` + orders.map(o =>
+        `• ${new Date(o.created_at).toLocaleDateString("fr-FR")} — ${o.total_price}€ — ${o.financial_status}`
+      ).join("\n");
     } catch (err) { return `❌ ${err.message}`; }
   }
 
@@ -282,7 +313,7 @@ async function handleCommand(command, from) {
       const icons = { active: "✅", archived: "📦", draft: "📝" };
       let response = `🛍️ *Produits DodoDog (${products.length})*\n\n`;
       products.slice(0, 20).forEach(p => {
-        response += `${icons[p.status] || "•"} [${p.id}] ${p.title} — ${p.variants[0]?.price}€\n`;
+        response += `${icons[p.status] || "•"} [ID:${p.id}] ${p.title}\n  Prix: ${p.variants[0]?.price}€ | Variant ID: ${p.variants[0]?.id}\n`;
       });
       if (products.length > 20) response += `\n_...et ${products.length - 20} autres_`;
       return response.trim();
@@ -300,7 +331,9 @@ async function handleCommand(command, from) {
   if (cmd === "/memory") {
     const mem = await pool.query(`SELECT key, value, tags, updated_at FROM memory ORDER BY updated_at DESC LIMIT 30`);
     if (!mem.rows.length) return "🧠 Mémoire vide.";
-    return `🧠 *Mémoire (${mem.rows.length})*\n\n` + mem.rows.map(r => `[${r.tags || "general"}] *${r.key}*: ${r.value} _(${new Date(r.updated_at).toLocaleDateString("fr-FR")})_`).join("\n");
+    return `🧠 *Mémoire (${mem.rows.length})*\n\n` + mem.rows.map(r =>
+      `[${r.tags || "general"}] *${r.key}*: ${r.value} _(${new Date(r.updated_at).toLocaleDateString("fr-FR")})_`
+    ).join("\n");
   }
 
   if (cmd === "/clear") {
@@ -313,27 +346,6 @@ async function handleCommand(command, from) {
   }
 
   return null;
-}
-
-// ═══════════════════════════════
-// DÉTECTION ET EXÉCUTION D'ACTIONS
-// ═══════════════════════════════
-async function processShopifyAction(reply, from) {
-  // Détecte le format [ACTION:type:id:{"key":"value"}]
-  const match = reply.match(/\[ACTION:(update_product|update_price):(\d+):(\{[^}]+\})\]/);
-  if (!match) return null;
-
-  const [, actionType, id, dataStr] = match;
-  let updates;
-  try { updates = JSON.parse(dataStr); } catch { return null; }
-
-  const preview = actionType === "update_price"
-    ? `Modifier prix variant #${id} → ${updates.price}€`
-    : `Modifier produit #${id} → ${JSON.stringify(updates)}`;
-
-  await savePendingAction(from, actionType, id, updates, preview);
-  console.log(`⏳ Action en attente: ${preview}`);
-  return preview;
 }
 
 // ═══════════════════════════════
@@ -379,27 +391,27 @@ async function sendWhatsApp(to, body) {
 // ═══════════════════════════════
 const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant IA personnel d'Alexis San Jose, entrepreneur e-commerce en Gironde. Tu gères son business de A à Z.
 
-Tu as un ACCÈS API RÉEL ET FONCTIONNEL à Shopify DodoDog en lecture ET écriture. Tu PEUX modifier les produits, prix et descriptions directement. Ce n'est PAS une limitation — c'est une capacité réelle.
+Tu as un ACCÈS API RÉEL ET FONCTIONNEL à Shopify DodoDog en lecture ET écriture. Tu PEUX modifier les produits, prix et descriptions directement.
 
 ═══════════════════════════════
 COMMENT MODIFIER UN PRODUIT SHOPIFY
 ═══════════════════════════════
-Quand Alexis te demande de modifier un produit, tu dois :
+Quand Alexis demande une modification, les IDs réels des produits sont injectés dans ce contexte.
 
-1. Utiliser les données produits injectées dans ce contexte (IDs réels)
-2. Proposer la modification avec un aperçu clair
-3. Inclure le bloc d'action DANS ta réponse (le système l'intercepte automatiquement) :
-
-Pour modifier titre/description :
+Pour modifier titre/description — utilise le product_id :
 [ACTION:update_product:PRODUCT_ID:{"title":"nouveau titre"}]
 
-Pour modifier un prix (ID du VARIANT, pas du produit) :
+Pour modifier un prix — utilise le variant_id (PAS le product_id) :
 [ACTION:update_price:VARIANT_ID:{"price":"35.00"}]
 
-IMPORTANT : Le bloc [ACTION:...] est INVISIBLE pour Alexis — il sera intercepté par le système. Tu n'as pas besoin d'expliquer ce mécanisme. Inclus-le simplement dans ta réponse après avoir proposé la modification.
+RÈGLES :
+1. Toujours proposer la modification avec l'aperçu AVANT le bloc ACTION
+2. Inclure le bloc ACTION dans ta réponse (il est invisible pour Alexis, le système l'intercepte)
+3. Utiliser EXACTEMENT les IDs fournis dans les données produits — ne jamais inventer un ID
+4. Attendre "oui" pour que l'action soit exécutée
 
-Exemple de bonne réponse :
-"Je vais passer le prix du Lit Orthopédique à 45€. Tu confirmes ?
+Exemple :
+"Je vais modifier le prix à 45€. Tu confirmes ?
 [ACTION:update_price:45678901234:{"price":"45.00"}]"
 
 ═══════════════════════════════
@@ -410,7 +422,7 @@ Campagne Google Ads : PMax feed only, 15€/jour
 GMC : 230 fiches validées
 Tailles/races : S→Chihuahua | M→Beagle | L→Berger Australien | XL→Labrador
 Charte : #FFFFFF, terracotta #D26046, #1A1A1B, Josefin Sans
-Code promo panier abandonné : DOG10
+Code promo : DOG10
 
 ═══════════════════════════════
 BOUTIQUE 2 — VERANO LUMIÈRE PARIS
@@ -431,7 +443,7 @@ En construction, niche bébé/poussette
 RÈGLES ABSOLUES
 ═══════════════════════════════
 1. Répondre en français
-2. Proposer avant d'exécuter (inclure le bloc ACTION dans la proposition)
+2. Proposer avant d'exécuter
 3. Actions risquées → double confirmation
 4. Concis et actionnable
 5. Utiliser la mémoire persistante
@@ -455,7 +467,7 @@ app.post("/webhook", async (req, res) => {
   if (isUrgent(text)) console.log(`🚨 URGENCE: ${text}`);
   console.log(`📩 ${from}: ${text || "[image]"}`);
 
-  res.status(200).send(''); // Réponse immédiate à Twilio
+  res.status(200).send('');
 
   try {
     const cmdReply = await handleCommand(text, from);
@@ -469,18 +481,21 @@ app.post("/webhook", async (req, res) => {
     const history = await getHistory(from);
     const relevantMemory = await getRelevantMemory(text);
 
-    // Injecte les données Shopify selon le contexte
+    // Injecte les données Shopify avec les vrais IDs
     let shopifyContext = "";
-    const isShopifyQuery = ["commande", "vente", "produit", "stock", "prix", "revenu", "chiffre", "boutique", "shopify", "modifie", "modifier", "change", "changer", "crée", "ajoute"].some(k => text.toLowerCase().includes(k));
+    const isShopifyQuery = ["commande", "vente", "produit", "stock", "prix", "revenu", "chiffre",
+      "boutique", "shopify", "modifie", "modifier", "change", "changer", "crée", "ajoute",
+      "titre", "description", "actif", "archiv", "brouillon"].some(k => text.toLowerCase().includes(k));
 
     if (isShopifyQuery) {
       try {
-        // Récupère produits ET stats pour donner à Claude les vrais IDs
         const [products, stats] = await Promise.all([getShopifyProducts(), getShopifyStats()]);
 
-        const productList = products.slice(0, 30).map(p => {
-          const variantInfo = p.variants.map(v => `variant_id:${v.id} prix:${v.price}€${v.title !== "Default Title" ? ` (${v.title})` : ""}`).join(" | ");
-          return `- [product_id:${p.id}] "${p.title}" | statut:${p.status} | ${variantInfo}`;
+        const productList = products.map(p => {
+          const variants = p.variants.map(v =>
+            `    variant_id:${v.id} | prix:${v.price}€${v.title !== "Default Title" ? ` | option:${v.title}` : ""}`
+          ).join("\n");
+          return `  product_id:${p.id} | "${p.title}" | statut:${p.status}\n${variants}`;
         }).join("\n");
 
         shopifyContext = `\n\n═══════════════════════════════
@@ -489,13 +504,12 @@ DONNÉES SHOPIFY DODODOG (TEMPS RÉEL)
 Commandes (30j): ${stats.orders_30j} | Revenu: ${stats.revenue_30j}€
 Produits: ${stats.products_active} actifs, ${stats.products_archived} archivés, ${stats.products_draft} brouillons
 
-CATALOGUE COMPLET AVEC IDs (utilise ces IDs pour les actions) :
-${productList}${products.length > 30 ? `\n... et ${products.length - 30} autres` : ""}`;
+CATALOGUE COMPLET — IDs EXACTS À UTILISER :
+${productList}`;
 
         console.log(`📊 Contexte Shopify injecté: ${products.length} produits`);
       } catch (err) {
         console.error("Contexte Shopify:", err.message);
-        shopifyContext = `\n\nErreur récupération données Shopify: ${err.message}`;
       }
     }
 
@@ -517,15 +531,14 @@ ${productList}${products.length > 30 ? `\n... et ${products.length - 30} autres`
       reply = response.content[0].text;
     }
 
-    // Intercepte les actions Shopify dans la réponse
+    // Intercepte les actions Shopify
     await processShopifyAction(reply, from);
 
-    // Nettoie le bloc [ACTION:...] avant envoi WhatsApp
+    // Nettoie le bloc [ACTION:...] avant envoi
     const cleanReply = reply.replace(/\[ACTION:[^\]]+\]/g, "").trim();
-
     await saveMessage(from, "assistant", cleanReply);
 
-    // Mémoire manuelle uniquement (évite le 429)
+    // Mémoire manuelle uniquement
     if (["retiens", "souviens", "note que", "mémorise", "n'oublie pas"].some(t => text.toLowerCase().includes(t))) {
       saveMemory(`note_${Date.now()}`, text, "manuel").catch(() => {});
     }
