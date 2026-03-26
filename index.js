@@ -43,7 +43,7 @@ function selectModel(text) {
   const sonnetTriggers = ["analyse", "stratégie", "rédige", "écris", "propose", "optimise",
     "campagne", "performance", "résultat", "plan", "compare", "explique", "comment faire",
     "diagnostic", "améliore", "crée", "génère", "rapport", "bilan", "description", "fiche",
-    "email", "pourquoi", "modifie", "modifier", "change", "changer", "prix", "titre"];
+    "email", "pourquoi", "modifie", "modifier", "change", "changer", "prix", "titre", "meta", "seo"];
   if (sonnetTriggers.some(trigger => t.includes(trigger))) { console.log(`🧠 Sonnet`); return MODEL_SONNET; }
   console.log(`⚡ Haiku`); return MODEL_HAIKU;
 }
@@ -205,23 +205,39 @@ async function getShopifyStats() {
   };
 }
 
-// Exécute une modification Shopify avec vérification de l'ID
+// ═══════════════════════════════
+// EXÉCUTION DES ACTIONS SHOPIFY
+// ═══════════════════════════════
 async function executeShopifyModification(actionType, id, updates) {
   const numId = parseInt(id);
   if (isNaN(numId)) throw new Error(`ID invalide: ${id}`);
 
   if (actionType === "update_product") {
-    // Vérifie que le produit existe
-    try {
-      await shopifyRequest("GET", `/products/${numId}.json`);
-    } catch {
-      // Essaie de trouver le produit par correspondance dans les produits existants
-      const products = await getShopifyProducts();
-      const found = products.find(p => p.id === numId || String(p.id) === String(id));
-      if (!found) throw new Error(`Produit ID ${numId} introuvable. Utilise /produits pour voir les vrais IDs.`);
+    // Construit le payload produit
+    const productPayload = { id: numId };
+
+    if (updates.title) productPayload.title = updates.title;
+    if (updates.body_html) productPayload.body_html = updates.body_html;
+    if (updates.status) productPayload.status = updates.status;
+
+    // Met à jour le produit principal
+    await shopifyRequest("PUT", `/products/${numId}.json`, { product: productPayload });
+
+    // Met à jour les metafields SEO si présents
+    if (updates.seo_title || updates.seo_description) {
+      const metafieldsToUpdate = [];
+      if (updates.seo_title) {
+        metafieldsToUpdate.push({ namespace: "global", key: "title_tag", value: updates.seo_title, type: "single_line_text_field" });
+      }
+      if (updates.seo_description) {
+        metafieldsToUpdate.push({ namespace: "global", key: "description_tag", value: updates.seo_description, type: "single_line_text_field" });
+      }
+      for (const mf of metafieldsToUpdate) {
+        await shopifyRequest("POST", `/products/${numId}/metafields.json`, { metafield: mf });
+      }
     }
-    await shopifyRequest("PUT", `/products/${numId}.json`, { product: { id: numId, ...updates } });
-    return `✅ Produit modifié avec succès.`;
+
+    return `✅ Produit #${numId} modifié avec succès.`;
   }
 
   if (actionType === "update_price") {
@@ -257,16 +273,30 @@ async function cancelAction(phone) {
   await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
 }
 
-// Détecte le bloc [ACTION:...] dans la réponse de Claude
+// Détecte le bloc ACTION dans la réponse de Claude
+// Supporte les JSON complexes avec guillemets imbriqués
 async function processShopifyAction(reply, from) {
-  const match = reply.match(/\[ACTION:(update_product|update_price):(\d+):(\{[^}]+\})\]/);
+  // Cherche [ACTION:type:id: suivi d'un JSON jusqu'à la dernière accolade fermante avant ]
+  const match = reply.match(/\[ACTION:(update_product|update_price):(\d+):([\s\S]*?)\](?=\s|$)/);
   if (!match) return null;
+
   const [, actionType, id, dataStr] = match;
   let updates;
-  try { updates = JSON.parse(dataStr); } catch { return null; }
-  const preview = actionType === "update_price"
-    ? `Modifier prix variant #${id} → ${updates.price}€`
-    : `Modifier produit #${id} → ${JSON.stringify(updates)}`;
+  try {
+    updates = JSON.parse(dataStr.trim());
+  } catch (err) {
+    console.error("Erreur parsing action JSON:", dataStr, err.message);
+    return null;
+  }
+
+  const previewParts = [];
+  if (updates.title) previewParts.push(`titre: "${updates.title}"`);
+  if (updates.body_html) previewParts.push(`description: ${updates.body_html.slice(0, 50)}...`);
+  if (updates.seo_title) previewParts.push(`SEO titre: "${updates.seo_title}"`);
+  if (updates.seo_description) previewParts.push(`SEO desc: "${updates.seo_description.slice(0, 50)}..."`);
+  if (updates.price) previewParts.push(`prix: ${updates.price}€`);
+
+  const preview = `Modifier produit #${id} → ${previewParts.join(" | ") || JSON.stringify(updates)}`;
   await savePendingAction(from, actionType, id, updates, preview);
   return preview;
 }
@@ -391,28 +421,36 @@ async function sendWhatsApp(to, body) {
 // ═══════════════════════════════
 const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant IA personnel d'Alexis San Jose, entrepreneur e-commerce en Gironde. Tu gères son business de A à Z.
 
-Tu as un ACCÈS API RÉEL ET FONCTIONNEL à Shopify DodoDog en lecture ET écriture. Tu PEUX modifier les produits, prix et descriptions directement.
+Tu as un ACCÈS API RÉEL ET FONCTIONNEL à Shopify DodoDog en lecture ET écriture.
 
 ═══════════════════════════════
 COMMENT MODIFIER UN PRODUIT SHOPIFY
 ═══════════════════════════════
-Quand Alexis demande une modification, les IDs réels des produits sont injectés dans ce contexte.
+Utilise les IDs exacts fournis dans les données produits injectées dans ce contexte.
 
-Pour modifier titre/description — utilise le product_id :
-[ACTION:update_product:PRODUCT_ID:{"title":"nouveau titre"}]
+FORMAT DU BLOC ACTION (JSON valide obligatoire) :
+[ACTION:update_product:PRODUCT_ID:{"title":"nouveau titre","body_html":"<p>description</p>","seo_title":"titre SEO","seo_description":"description SEO"}]
 
-Pour modifier un prix — utilise le variant_id (PAS le product_id) :
+Pour modifier uniquement le prix (utilise le VARIANT_ID) :
 [ACTION:update_price:VARIANT_ID:{"price":"35.00"}]
 
-RÈGLES :
-1. Toujours proposer la modification avec l'aperçu AVANT le bloc ACTION
-2. Inclure le bloc ACTION dans ta réponse (il est invisible pour Alexis, le système l'intercepte)
-3. Utiliser EXACTEMENT les IDs fournis dans les données produits — ne jamais inventer un ID
-4. Attendre "oui" pour que l'action soit exécutée
+CHAMPS DISPONIBLES pour update_product :
+- title : titre du produit
+- body_html : description (HTML autorisé, ex: <p>texte</p>)
+- seo_title : titre SEO (balise meta title)
+- seo_description : description SEO (balise meta description)
+- status : "active", "archived", "draft"
 
-Exemple :
-"Je vais modifier le prix à 45€. Tu confirmes ?
-[ACTION:update_price:45678901234:{"price":"45.00"}]"
+RÈGLES ABSOLUES :
+1. Proposer la modification avec aperçu AVANT le bloc ACTION
+2. Le bloc ACTION est intercepté automatiquement — invisible pour Alexis
+3. Utiliser EXACTEMENT les IDs fournis — ne jamais inventer un ID
+4. JSON strictement valide — pas de virgule finale, guillemets doubles uniquement
+5. Si plusieurs modifications → un seul bloc ACTION avec tous les champs
+
+Exemple correct :
+"Je vais modifier le titre, la description et le SEO de ce produit. Tu confirmes ?
+[ACTION:update_product:9876543210:{"title":"Nouveau titre","body_html":"<p>Nouvelle description.</p>","seo_title":"Titre SEO optimisé","seo_description":"Description SEO optimisée pour Google"}]"
 
 ═══════════════════════════════
 BOUTIQUE 1 — DODODOG (dododog.fr)
@@ -485,7 +523,7 @@ app.post("/webhook", async (req, res) => {
     let shopifyContext = "";
     const isShopifyQuery = ["commande", "vente", "produit", "stock", "prix", "revenu", "chiffre",
       "boutique", "shopify", "modifie", "modifier", "change", "changer", "crée", "ajoute",
-      "titre", "description", "actif", "archiv", "brouillon"].some(k => text.toLowerCase().includes(k));
+      "titre", "description", "actif", "archiv", "brouillon", "seo", "meta"].some(k => text.toLowerCase().includes(k));
 
     if (isShopifyQuery) {
       try {
@@ -525,7 +563,7 @@ ${productList}`;
       await saveMessage(from, "user", text);
       history.push({ role: "user", content: text });
       const response = await anthropic.messages.create({
-        model: selectModel(text), max_tokens: 1024,
+        model: selectModel(text), max_tokens: 2048,
         system: systemWithMemory, messages: history,
       });
       reply = response.content[0].text;
@@ -535,7 +573,7 @@ ${productList}`;
     await processShopifyAction(reply, from);
 
     // Nettoie le bloc [ACTION:...] avant envoi
-    const cleanReply = reply.replace(/\[ACTION:[^\]]+\]/g, "").trim();
+    const cleanReply = reply.replace(/\[ACTION:[\s\S]*?\](?=\s|$)/g, "").trim();
     await saveMessage(from, "assistant", cleanReply);
 
     // Mémoire manuelle uniquement
