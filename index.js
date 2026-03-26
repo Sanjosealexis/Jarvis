@@ -341,7 +341,7 @@ async function processShopifyAction(reply, from) {
 async function handleCommand(command, from) {
   const cmd = command.trim().toLowerCase();
 
-  if (["oui", "confirmer", "ok go", "valider", "yes"].includes(cmd)) {
+  if (["oui", "confirmer", "ok go", "valider", "yes"].some(w => cmd.includes(w))) {
     try {
       const result = await confirmAction(from);
       if (result) return result;
@@ -349,7 +349,7 @@ async function handleCommand(command, from) {
     return null;
   }
 
-  if (["non", "annuler", "cancel", "no"].includes(cmd)) {
+  if (["non", "annuler", "cancel", "no"].some(w => cmd.includes(w))) {
     await cancelAction(from);
     return `🚫 Action annulée.`;
   }
