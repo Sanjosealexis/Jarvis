@@ -49,17 +49,15 @@ function selectModel(text) {
     return MODEL_SONNET;
   }
   const sonnetTriggers = [
-    "analyse", "analyser", "analysons",
-    "stratégie", "stratégique",
-    "rédige", "rédiger", "écris", "propose",
-    "optimise", "optimiser",
-    "campagne", "performance", "résultat",
-    "plan", "planning", "compare", "comparaison",
-    "explique", "comment faire", "aide moi à",
+    "analyse", "analyser", "analysons", "stratégie", "stratégique",
+    "rédige", "rédiger", "écris", "propose", "optimise", "optimiser",
+    "campagne", "performance", "résultat", "plan", "planning",
+    "compare", "comparaison", "explique", "comment faire", "aide moi à",
     "diagnostic", "problème", "améliore", "améliorer",
     "crée", "créer", "génère", "rapport", "bilan",
-    "description produit", "fiche produit",
-    "email", "mail", "pourquoi", "comment se fait"
+    "description produit", "fiche produit", "email", "mail",
+    "pourquoi", "comment se fait", "modifie", "modifier", "change", "changer",
+    "prix", "titre", "description"
   ];
   if (sonnetTriggers.some(trigger => t.includes(trigger))) {
     console.log(`🧠 Modèle: Sonnet (tâche complexe)`);
@@ -119,9 +117,7 @@ async function initDB() {
 
 async function getHistory(phone) {
   const result = await pool.query(
-    `SELECT role, content FROM conversations 
-     WHERE user_phone = $1 
-     ORDER BY created_at DESC LIMIT 10`,
+    `SELECT role, content FROM conversations WHERE user_phone = $1 ORDER BY created_at DESC LIMIT 10`,
     [phone]
   );
   return result.rows.reverse();
@@ -135,7 +131,7 @@ async function saveMessage(phone, role, content) {
 }
 
 // ═══════════════════════════════
-// MÉMOIRE INFINIE PAR TAGS
+// MÉMOIRE
 // ═══════════════════════════════
 async function getRelevantMemory(userText) {
   const text = userText.toLowerCase();
@@ -151,24 +147,19 @@ async function getRelevantMemory(userText) {
     simprosys: ["simprosys", "custom label", "flux"],
     dsers: ["dsers", "fournisseur", "aliexpress", "commande"],
   };
-
   const matchedTags = [];
   for (const [tag, keywords] of Object.entries(tagMap)) {
     if (keywords.some(k => text.includes(k))) matchedTags.push(tag);
   }
-
   let result;
   if (matchedTags.length > 0) {
     const tagConditions = matchedTags.map((_, i) => `tags ILIKE $${i + 1}`).join(" OR ");
-    const tagValues = matchedTags.map(t => `%${t}%`);
     result = await pool.query(
       `SELECT key, value FROM memory WHERE ${tagConditions} ORDER BY updated_at DESC LIMIT 10`,
-      tagValues
+      matchedTags.map(t => `%${t}%`)
     );
     if (result.rows.length < 5) {
-      const extra = await pool.query(
-        `SELECT key, value FROM memory WHERE tags = '' OR tags IS NULL ORDER BY updated_at DESC LIMIT 5`
-      );
+      const extra = await pool.query(`SELECT key, value FROM memory WHERE tags = '' OR tags IS NULL ORDER BY updated_at DESC LIMIT 5`);
       result.rows = [...result.rows, ...extra.rows];
     }
   } else {
@@ -179,12 +170,10 @@ async function getRelevantMemory(userText) {
 
 async function saveMemory(key, value, tags = "") {
   await pool.query(
-    `INSERT INTO memory (key, value, tags) 
-     VALUES ($1, $2, $3)
-     ON CONFLICT (key) DO UPDATE SET value = $2, tags = $3, updated_at = NOW()`,
+    `INSERT INTO memory (key, value, tags) VALUES ($1, $2, $3) ON CONFLICT (key) DO UPDATE SET value = $2, tags = $3, updated_at = NOW()`,
     [key, value, tags]
   );
-  console.log(`💾 Mémoire sauvegardée: [${tags}] ${key} = ${value}`);
+  console.log(`💾 Mémoire: [${tags}] ${key} = ${value}`);
 }
 
 async function isAlreadyProcessed(messageSid) {
@@ -199,40 +188,6 @@ async function isAlreadyProcessed(messageSid) {
 }
 
 // ═══════════════════════════════
-// DÉTECTION MÉMOIRE AUTO
-// ═══════════════════════════════
-async function detectAndSaveMemory(userText, assistantReply) {
-  const manualTrigger = ["retiens", "souviens", "note que", "mémorise", "n'oublie pas"];
-  if (manualTrigger.some(t => userText.toLowerCase().includes(t))) {
-    await saveMemory(`note_${Date.now()}`, userText, "manuel");
-    return;
-  }
-  try {
-    const check = await anthropic.messages.create({
-      model: MODEL_HAIKU,
-      max_tokens: 200,
-      messages: [{
-        role: "user",
-        content: `Message: "${userText}"
-Réponse: "${assistantReply}"
-
-Est-ce que cet échange contient une info importante à mémoriser (décision, chiffre clé, changement de situation, préférence) ?
-Si oui: MEMORISER|clé_courte|valeur_à_retenir|tag1,tag2,tag3
-Tags possibles: dododog, verano, vellure, dodobaby, google_ads, gmc, shopify, finance, simprosys, dsers, general
-Si non: IGNORER`
-      }]
-    });
-    const decision = check.content[0].text.trim();
-    if (decision.startsWith("MEMORISER|")) {
-      const parts = decision.split("|");
-      if (parts.length === 4) await saveMemory(parts[1], parts[2], parts[3]);
-    }
-  } catch (err) {
-    console.error("Erreur détection mémoire auto:", err.message);
-  }
-}
-
-// ═══════════════════════════════
 // SHOPIFY OAUTH
 // ═══════════════════════════════
 const SHOPIFY_SHOP = process.env.SHOPIFY_DODODOG_URL;
@@ -241,99 +196,56 @@ const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_DODODOG_SECRET;
 const SHOPIFY_SCOPES = "read_products,write_products,read_orders,read_inventory,write_inventory,read_customers";
 const APP_URL = "https://jarvis-production-4d2f.up.railway.app";
 
-// Route d'installation OAuth — redirige vers Shopify
 app.get("/auth", (req, res) => {
   const shop = req.query.shop || SHOPIFY_SHOP;
   const redirectUri = `${APP_URL}/auth/callback`;
-  const authUrl = `https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${SHOPIFY_SCOPES}&redirect_uri=${redirectUri}`;
-  console.log(`🔐 OAuth redirect: ${authUrl}`);
-  res.redirect(authUrl);
+  res.redirect(`https://${shop}/admin/oauth/authorize?client_id=${SHOPIFY_CLIENT_ID}&scope=${SHOPIFY_SCOPES}&redirect_uri=${redirectUri}`);
 });
 
-// Route callback OAuth — capture le vrai token shpat_
 app.get("/auth/callback", async (req, res) => {
   const { shop, code, hmac } = req.query;
-
-  if (!shop || !code) {
-    return res.status(400).send("Paramètres manquants");
-  }
-
-  // Vérifie le HMAC pour sécuriser
-  const params = Object.keys(req.query)
-    .filter(k => k !== "hmac")
-    .sort()
-    .map(k => `${k}=${req.query[k]}`)
-    .join("&");
+  if (!shop || !code) return res.status(400).send("Paramètres manquants");
+  const params = Object.keys(req.query).filter(k => k !== "hmac").sort().map(k => `${k}=${req.query[k]}`).join("&");
   const digest = crypto.createHmac("sha256", SHOPIFY_CLIENT_SECRET).update(params).digest("hex");
-  if (digest !== hmac) {
-    console.error("❌ HMAC invalide");
-    return res.status(403).send("HMAC invalide");
-  }
-
+  if (digest !== hmac) return res.status(403).send("HMAC invalide");
   try {
-    // Échange le code contre le vrai token shpat_
     const response = await axios.post(`https://${shop}/admin/oauth/access_token`, {
-      client_id: SHOPIFY_CLIENT_ID,
-      client_secret: SHOPIFY_CLIENT_SECRET,
-      code,
+      client_id: SHOPIFY_CLIENT_ID, client_secret: SHOPIFY_CLIENT_SECRET, code,
     });
-
     const { access_token } = response.data;
-    console.log(`✅ Token Shopify obtenu pour ${shop}: ${access_token.slice(0, 10)}...`);
-
-    // Sauvegarde en base
     await pool.query(
-      `INSERT INTO shopify_tokens (shop, access_token)
-       VALUES ($1, $2)
-       ON CONFLICT (shop) DO UPDATE SET access_token = $2, updated_at = NOW()`,
+      `INSERT INTO shopify_tokens (shop, access_token) VALUES ($1, $2) ON CONFLICT (shop) DO UPDATE SET access_token = $2, updated_at = NOW()`,
       [shop, access_token]
     );
-
-    res.send(`
-      <html><body style="font-family:sans-serif;text-align:center;padding:50px">
-        <h1>✅ Jarvis connecté à ${shop}</h1>
-        <p>L'accès Shopify est configuré. Tu peux fermer cette page.</p>
-      </body></html>
-    `);
+    console.log(`✅ Token Shopify obtenu pour ${shop}`);
+    res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:50px"><h1>✅ Jarvis connecté à ${shop}</h1><p>Tu peux fermer cette page.</p></body></html>`);
   } catch (err) {
-    console.error("❌ Erreur OAuth callback:", err.message);
+    console.error("❌ OAuth callback:", err.message);
     res.status(500).send("Erreur lors de l'obtention du token");
   }
 });
 
-// Récupère le token depuis la base
 async function getShopifyToken() {
-  const result = await pool.query(
-    `SELECT access_token FROM shopify_tokens WHERE shop = $1`,
-    [SHOPIFY_SHOP]
-  );
-  if (result.rows.length === 0) {
-    throw new Error(`Pas de token Shopify. Installe l'app via: ${APP_URL}/auth`);
-  }
+  const result = await pool.query(`SELECT access_token FROM shopify_tokens WHERE shop = $1`, [SHOPIFY_SHOP]);
+  if (result.rows.length === 0) throw new Error(`Pas de token. Va sur: ${APP_URL}/auth`);
   return result.rows[0].access_token;
 }
 
 async function shopifyRequest(method, endpoint, data = null) {
+  const token = await getShopifyToken();
+  const url = `https://${SHOPIFY_SHOP}/admin/api/2024-01${endpoint}`;
+  console.log(`🛍️ Shopify ${method} ${endpoint}`);
+  const config = {
+    method, url,
+    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+  };
+  if (data) config.data = data;
   try {
-    const token = await getShopifyToken();
-    const url = `https://${SHOPIFY_SHOP}/admin/api/2024-01${endpoint}`;
-    console.log(`🛍️ Shopify ${method} ${endpoint}`);
-    const config = {
-      method,
-      url,
-      headers: {
-        "X-Shopify-Access-Token": token,
-        "Content-Type": "application/json",
-      },
-    };
-    if (data) config.data = data;
     const response = await axios(config);
-    console.log(`✅ Shopify réponse: ${response.status}`);
     return response.data;
   } catch (err) {
-    const errorDetail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
-    console.error(`❌ Shopify erreur: ${err.response?.status} — ${errorDetail}`);
-    throw new Error(`Shopify ${err.response?.status || 'erreur'}: ${errorDetail}`);
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    throw new Error(`Shopify ${err.response?.status}: ${detail}`);
   }
 }
 
@@ -343,78 +255,77 @@ async function getShopifyOrders(limit = 10) {
 }
 
 async function getShopifyProducts() {
-  // 3 appels séparés car status=any bug avec cette API
   const [active, archived, draft] = await Promise.all([
     shopifyRequest("GET", `/products.json?limit=250&status=active`),
     shopifyRequest("GET", `/products.json?limit=250&status=archived`),
     shopifyRequest("GET", `/products.json?limit=250&status=draft`),
   ]);
-  const all = [
-    ...(active.products || []),
-    ...(archived.products || []),
-    ...(draft.products || []),
-  ];
+  const all = [...(active.products || []), ...(archived.products || []), ...(draft.products || [])];
   console.log(`📦 Produits: actifs=${active.products?.length} archivés=${archived.products?.length} brouillons=${draft.products?.length} total=${all.length}`);
   return all;
 }
 
 async function getShopifyStats() {
   const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-  const [orders, products] = await Promise.all([
+  const [orders, active, archived, draft] = await Promise.all([
     shopifyRequest("GET", `/orders.json?limit=250&status=any&created_at_min=${since}`),
-    shopifyRequest("GET", `/products.json?limit=250`),
+    shopifyRequest("GET", `/products.json?limit=250&status=active`),
+    shopifyRequest("GET", `/products.json?limit=250&status=archived`),
+    shopifyRequest("GET", `/products.json?limit=250&status=draft`),
   ]);
-  const totalRevenue = orders.orders
-    .filter(o => o.financial_status === "paid")
-    .reduce((sum, o) => sum + parseFloat(o.total_price), 0);
+  const totalRevenue = orders.orders.filter(o => o.financial_status === "paid").reduce((sum, o) => sum + parseFloat(o.total_price), 0);
+  const total = (active.products?.length || 0) + (archived.products?.length || 0) + (draft.products?.length || 0);
   return {
     orders_30j: orders.orders.length,
     revenue_30j: totalRevenue.toFixed(2),
-    products_total: products.products.length,
-    products_active: products.products.filter(p => p.status === "active").length,
-    products_archived: products.products.filter(p => p.status === "archived").length,
-    products_draft: products.products.filter(p => p.status === "draft").length,
+    products_active: active.products?.length || 0,
+    products_archived: archived.products?.length || 0,
+    products_draft: draft.products?.length || 0,
+    products_total: total,
   };
 }
 
 // ═══════════════════════════════
-// SYSTÈME DE VALIDATION
+// ACTIONS SHOPIFY — INTERCEPTEUR
 // ═══════════════════════════════
-async function getPendingAction(phone) {
-  const result = await pool.query(
-    `SELECT * FROM pending_actions WHERE user_phone = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1`,
-    [phone]
+
+// Analyse la réponse de Claude pour détecter une action Shopify
+async function detectAndExecuteAction(reply, from) {
+  // Format attendu dans la réponse de Claude :
+  // [ACTION:update_product:PRODUCT_ID:{"title":"nouveau titre"}]
+  // [ACTION:update_price:VARIANT_ID:{"price":"29.99"}]
+  const actionRegex = /\[ACTION:(\w+):(\d+):(\{[^}]+\})\]/;
+  const match = reply.match(actionRegex);
+  if (!match) return null;
+
+  const [, actionType, id, dataStr] = match;
+  let actionData;
+  try { actionData = JSON.parse(dataStr); } catch { return null; }
+
+  // Sauvegarde l'action en pending
+  const preview = `Modifier ${actionType === 'update_price' ? 'prix' : 'produit'} ID ${id} → ${dataStr}`;
+  await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [from]);
+  await pool.query(
+    `INSERT INTO pending_actions (user_phone, action_type, action_data, preview) VALUES ($1, $2, $3, $4)`,
+    [from, actionType, JSON.stringify({ id, updates: actionData }), preview]
   );
-  return result.rows[0] || null;
+
+  return preview;
 }
 
-async function confirmPendingAction(phone) {
-  const action = await getPendingAction(phone);
-  if (!action) return null;
-  await pool.query(`UPDATE pending_actions SET status = 'confirmed' WHERE id = $1`, [action.id]);
-  return action;
-}
-
-async function cancelPendingAction(phone) {
-  await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [phone]);
-}
-
-async function executeShopifyAction(action) {
+async function executeAction(action) {
   const data = typeof action.action_data === 'string' ? JSON.parse(action.action_data) : action.action_data;
-  switch (action.action_type) {
-    case "update_product": {
-      await shopifyRequest("PUT", `/products/${data.product_id}.json`, { product: data.updates });
-      return `✅ Produit mis à jour avec succès.`;
-    }
-    case "update_price": {
-      await shopifyRequest("PUT", `/variants/${data.variant_id}.json`, {
-        variant: { id: data.variant_id, price: data.new_price }
-      });
-      return `✅ Prix mis à jour : ${data.new_price}€`;
-    }
-    default:
-      return `❌ Action inconnue : ${action.action_type}`;
+  const { id, updates } = data;
+
+  if (action.action_type === 'update_product') {
+    await shopifyRequest("PUT", `/products/${id}.json`, { product: { id, ...updates } });
+    return `✅ Produit mis à jour avec succès.`;
   }
+  if (action.action_type === 'update_price') {
+    await shopifyRequest("PUT", `/variants/${id}.json`, { variant: { id, price: updates.price } });
+    return `✅ Prix mis à jour : ${updates.price}€`;
+  }
+  return `❌ Action inconnue`;
 }
 
 // ═══════════════════════════════
@@ -423,17 +334,21 @@ async function executeShopifyAction(action) {
 async function handleCommand(command, from) {
   const cmd = command.trim().toLowerCase();
 
-  if (cmd === "oui" || cmd === "confirmer" || cmd === "ok go" || cmd === "valider") {
-    const action = await confirmPendingAction(from);
-    if (action) {
-      try { return await executeShopifyAction(action); }
+  if (["oui", "confirmer", "ok go", "valider", "yes"].includes(cmd)) {
+    const result = await pool.query(
+      `SELECT * FROM pending_actions WHERE user_phone = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1`, [from]
+    );
+    if (result.rows.length > 0) {
+      const action = result.rows[0];
+      await pool.query(`UPDATE pending_actions SET status = 'confirmed' WHERE id = $1`, [action.id]);
+      try { return await executeAction(action); }
       catch (err) { return `❌ Erreur : ${err.message}`; }
     }
     return null;
   }
 
-  if (cmd === "non" || cmd === "annuler" || cmd === "cancel") {
-    await cancelPendingAction(from);
+  if (["non", "annuler", "cancel", "no"].includes(cmd)) {
+    await pool.query(`UPDATE pending_actions SET status = 'cancelled' WHERE user_phone = $1 AND status = 'pending'`, [from]);
     return `🚫 Action annulée.`;
   }
 
@@ -447,9 +362,7 @@ async function handleCommand(command, from) {
       byTag[tag].push(`• ${r.key}: ${r.value}`);
     });
     let response = "📊 *Status Jarvis*\n\n";
-    for (const [tag, items] of Object.entries(byTag)) {
-      response += `*${tag.toUpperCase()}*\n${items.join("\n")}\n\n`;
-    }
+    for (const [tag, items] of Object.entries(byTag)) response += `*${tag.toUpperCase()}*\n${items.join("\n")}\n\n`;
     return response.trim();
   }
 
@@ -472,25 +385,21 @@ async function handleCommand(command, from) {
   if (cmd === "/stats" || cmd === "/shopify") {
     try {
       const stats = await getShopifyStats();
-      return `📊 *DodoDog — Stats 30 jours*\n\n• Commandes : ${stats.orders_30j}\n• Revenus : ${stats.revenue_30j}€\n• Produits actifs : ${stats.products_active}\n• Produits archivés : ${stats.products_archived}\n• Brouillons : ${stats.products_draft}\n• Total : ${stats.products_total}`;
-    } catch (err) {
-      return `❌ Erreur Shopify : ${err.message}`;
-    }
+      return `📊 *DodoDog — Stats 30 jours*\n\n• Commandes : ${stats.orders_30j}\n• Revenus : ${stats.revenue_30j}€\n• Actifs : ${stats.products_active} | Archivés : ${stats.products_archived} | Brouillons : ${stats.products_draft}`;
+    } catch (err) { return `❌ Erreur Shopify : ${err.message}`; }
   }
 
   if (cmd === "/commandes") {
     try {
       const orders = await getShopifyOrders(5);
       if (orders.length === 0) return "📦 Aucune commande récente.";
-      let response = `📦 *5 dernières commandes DodoDog*\n\n`;
+      let response = `📦 *5 dernières commandes*\n\n`;
       orders.forEach(o => {
         const date = new Date(o.created_at).toLocaleDateString("fr-FR");
         response += `• ${date} — ${o.total_price}€ — ${o.financial_status}\n`;
       });
       return response.trim();
-    } catch (err) {
-      return `❌ Erreur Shopify : ${err.message}`;
-    }
+    } catch (err) { return `❌ Erreur : ${err.message}`; }
   }
 
   if (cmd === "/produits") {
@@ -498,18 +407,16 @@ async function handleCommand(command, from) {
       const products = await getShopifyProducts();
       let response = `🛍️ *Produits DodoDog (${products.length})*\n\n`;
       products.slice(0, 15).forEach(p => {
-        const statusIcon = p.status === "active" ? "✅" : p.status === "archived" ? "📦" : "📝";
-        response += `${statusIcon} ${p.title} — ${p.variants[0]?.price}€\n`;
+        const icon = p.status === "active" ? "✅" : p.status === "archived" ? "📦" : "📝";
+        response += `${icon} ${p.title} — ${p.variants[0]?.price}€\n`;
       });
       if (products.length > 15) response += `\n_...et ${products.length - 15} autres_`;
       return response.trim();
-    } catch (err) {
-      return `❌ Erreur Shopify : ${err.message}`;
-    }
+    } catch (err) { return `❌ Erreur : ${err.message}`; }
   }
 
   if (cmd === "/help") {
-    return `🤖 *Commandes Jarvis*\n\n*Info*\n/stats — stats DodoDog 30 jours\n/commandes — 5 dernières commandes\n/produits — liste des produits\n/status — mémoire par boutique\n/memory — tout ce que je sais\n\n*Gestion*\n/clear — efface l'historique\n\n*Validation*\noui / confirmer — valide une action\nnon / annuler — annule une action\n\nTu peux aussi m'envoyer des 📸 photos !`;
+    return `🤖 *Commandes Jarvis*\n\n*Shopify*\n/stats — stats 30 jours\n/commandes — 5 dernières commandes\n/produits — liste des produits\n\n*Mémoire*\n/status — mémoire par boutique\n/memory — tout ce que je sais\n/clear — efface l'historique\n\n*Validation*\noui — valide une action\nnon — annule une action\n\nTu peux aussi m'envoyer des 📸 photos !`;
   }
 
   return null;
@@ -524,27 +431,21 @@ async function handleImageMessage(req, history, systemWithMemory) {
   const mediaUrl = req.body.MediaUrl0;
   const mediaType = req.body.MediaContentType0;
   const caption = req.body.Body || "";
-  if (!mediaType?.startsWith("image/")) return "Je ne peux traiter que des images pour l'instant.";
-  console.log(`🖼️ Image reçue: ${mediaType}`);
+  if (!mediaType?.startsWith("image/")) return "Je ne peux traiter que des images.";
   const imageResponse = await axios.get(mediaUrl, {
     responseType: "arraybuffer",
     auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN },
   });
   const base64Image = Buffer.from(imageResponse.data).toString("base64");
-  const userMessage = {
-    role: "user",
-    content: [
-      { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
-      { type: "text", text: caption || "Analyse cette image et dis-moi ce que tu vois en lien avec mon business." },
-    ],
-  };
   const response = await anthropic.messages.create({
-    model: MODEL_SONNET,
-    max_tokens: 1024,
-    system: systemWithMemory,
-    messages: [...history, userMessage],
+    model: MODEL_SONNET, max_tokens: 1024, system: systemWithMemory,
+    messages: [...history, {
+      role: "user", content: [
+        { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
+        { type: "text", text: caption || "Analyse cette image en lien avec mon business." },
+      ]
+    }]
   });
-  console.log(`🧠 Modèle: Sonnet (analyse image)`);
   return response.content[0].text;
 }
 
@@ -553,96 +454,85 @@ async function handleImageMessage(req, history, systemWithMemory) {
 // ═══════════════════════════════
 async function sendWhatsApp(to, body) {
   const maxLength = 1600;
-  if (body.length > maxLength) {
-    const parts = [];
-    for (let i = 0; i < body.length; i += maxLength) parts.push(body.slice(i, i + maxLength));
-    for (const part of parts) {
-      await axios.post(
-        `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
-        new URLSearchParams({ From: `whatsapp:${process.env.TWILIO_NUMBER}`, To: to, Body: part }),
-        { auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN } }
-      );
-      await new Promise(r => setTimeout(r, 500));
-    }
-    return;
+  const parts = [];
+  for (let i = 0; i < body.length; i += maxLength) parts.push(body.slice(i, i + maxLength));
+  for (const part of parts) {
+    await axios.post(
+      `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
+      new URLSearchParams({ From: `whatsapp:${process.env.TWILIO_NUMBER}`, To: to, Body: part }),
+      { auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN } }
+    );
+    if (parts.length > 1) await new Promise(r => setTimeout(r, 500));
   }
-  await axios.post(
-    `https://api.twilio.com/2010-04-01/Accounts/${process.env.TWILIO_SID}/Messages.json`,
-    new URLSearchParams({ From: `whatsapp:${process.env.TWILIO_NUMBER}`, To: to, Body: body }),
-    { auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN } }
-  );
 }
 
 // ═══════════════════════════════
 // SYSTEM PROMPT
 // ═══════════════════════════════
-const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant personnel IA d'Alexis San Jose, entrepreneur e-commerce basé en Gironde, France. Tu gères tout son business de A à Z. Tu es son bras droit opérationnel.
+const JARVIS_SYSTEM = `Tu es Jarvis, l'assistant personnel IA d'Alexis San Jose, entrepreneur e-commerce basé en Gironde, France. Tu gères tout son business de A à Z.
 
-Tu as accès à l'API Shopify de DodoDog en lecture et en écriture.
+Tu as un ACCÈS API COMPLET à Shopify DodoDog — lecture ET écriture. Tu peux modifier les produits, prix, descriptions directement.
 
 ═══════════════════════════════
-RÈGLES DE VALIDATION OBLIGATOIRES
+COMMENT EXÉCUTER DES ACTIONS SHOPIFY
 ═══════════════════════════════
-AVANT toute modification Shopify, tu dois TOUJOURS :
-1. PROPOSER ce que tu vas faire avec un aperçu clair
-2. Attendre la confirmation "oui" ou "confirmer" d'Alexis
-3. Pour les modifications en masse : appliquer sur 1 produit test d'abord, attendre "confirmer tout"
-4. Pour les actions risquées : demander une double confirmation
-Tu ne modifies JAMAIS Shopify sans confirmation explicite d'Alexis.
+Pour modifier un produit, tu dois d'abord récupérer son ID via /produits, puis inclure dans ta réponse un bloc d'action au format exact :
+
+Pour modifier le titre ou la description :
+[ACTION:update_product:PRODUCT_ID:{"title":"nouveau titre"}]
+
+Pour modifier un prix (utilise l'ID du variant, pas du produit) :
+[ACTION:update_price:VARIANT_ID:{"price":"29.99"}]
+
+RÈGLES OBLIGATOIRES :
+1. Toujours montrer l'aperçu de la modification AVANT d'inclure le bloc ACTION
+2. Attendre "oui" d'Alexis avant que l'action soit exécutée
+3. Pour les modifications en masse : tester sur 1 produit, attendre "confirmer tout"
+4. Ne JAMAIS inclure le bloc [ACTION:...] sans avoir proposé la modification d'abord
+5. Toujours préciser l'ID du produit/variant concerné
+
+Exemple correct :
+"Je vais modifier le prix du Panier L (variant ID 12345) de 29€ à 35€. Tu confirmes ?"
+[ACTION:update_price:12345:{"price":"35.00"}]
 
 ═══════════════════════════════
 BOUTIQUE 1 — DODODOG (dododog.fr)
 ═══════════════════════════════
 Niche : accessoires et couchage chiens premium, marché français
-Produits : 23 produits actifs — paniers, lits, tapis (en pub) + harnais, colliers, accessoires (pas en pub)
-Fournisseurs : DSers (AliExpress) + scraping concurrent
+Produits : actifs + archivés + brouillons accessibles via API
 Campagne Google Ads : PMax feed only, budget 15€/jour
-GMC : 230 fiches validées, statut En stock
-Gestion flux : Simprosys + custom labels
+GMC : 230 fiches validées
 Correspondance tailles/races :
-  - S → Chihuahua
-  - M → Beagle / Border Collie
-  - L → Berger Australien
-  - XL → Labrador / Golden Retriever
-Charte graphique : fond blanc #FFFFFF, terracotta #D26046, dark #1A1A1B, font Josefin Sans
+  - S → Chihuahua | M → Beagle/Border Collie | L → Berger Australien | XL → Labrador
+Charte : fond blanc #FFFFFF, terracotta #D26046, dark #1A1A1B, Josefin Sans
 Code promo panier abandonné : DOG10
-Boutique Etsy : DodoDogFR
 
 ═══════════════════════════════
-BOUTIQUE 2 — VERANO LUMIÈRE PARIS (veranolumiereparis.fr)
+BOUTIQUE 2 — VERANO LUMIÈRE PARIS
 ═══════════════════════════════
 Niche : luminaires design, marché français premium
-Statut : rouvert récemment, GMC 360 fiches en stock limité en attente de validation
-Charte graphique : bronze #A8815C, fond blanc #FFFFFF, minimaliste luxe
+Charte : bronze #A8815C, fond blanc, minimaliste luxe
 
 ═══════════════════════════════
 BOUTIQUE 3 — VELLURE
 ═══════════════════════════════
-Statut : repositionnement sur nouvelle niche mono mot-clé à définir
+Statut : repositionnement niche mono mot-clé à définir
 
 ═══════════════════════════════
 BOUTIQUE 4 — DODOBABY
 ═══════════════════════════════
-Statut : en construction, niche bébé/poussette, marché français
-
-═══════════════════════════════
-OUTILS
-═══════════════════════════════
-Shopify (accès API DodoDog actif), Google Ads, GMC, Simprosys, DSers, Nano Banana Pro 2
+Statut : en construction, niche bébé/poussette
 
 ═══════════════════════════════
 RÈGLES ABSOLUES
 ═══════════════════════════════
 1. Toujours répondre en français
-2. Toujours proposer avant d'exécuter
+2. Proposer avant d'exécuter — jamais d'action sans confirmation
 3. Actions simples → confirmation oui/non
 4. Actions risquées → double confirmation
-5. Actions lecture seule → réponse directe
-6. Concis et actionnable, jamais de blabla
-7. Ne jamais redemander des infos déjà connues
-8. Tu as une mémoire persistante — utilise-la pour t'améliorer continuellement
-9. Si tu apprends quelque chose d'important sur Alexis ou son business, mémorise-le
-10. En cas d'urgence détectée, réponds en priorité absolue avec 🚨 en début de message`;
+5. Concis et actionnable
+6. Mémoire persistante — utilise-la
+7. Urgence → 🚨 en priorité absolue`;
 
 // ═══════════════════════════════
 // WEBHOOK
@@ -668,15 +558,12 @@ app.post("/webhook", async (req, res) => {
   if (from === `whatsapp:${process.env.TWILIO_NUMBER}`) return res.status(200).send('');
 
   const alreadyDone = await isAlreadyProcessed(messageSid);
-  if (alreadyDone) {
-    console.log(`Message déjà traité: ${messageSid}`);
-    return res.status(200).send('');
-  }
+  if (alreadyDone) return res.status(200).send('');
 
-  if (isUrgent(text)) console.log(`🚨 URGENCE détectée: ${text}`);
-  console.log(`📩 Message de ${from}: ${text || "[image]"}`);
+  if (isUrgent(text)) console.log(`🚨 URGENCE: ${text}`);
+  console.log(`📩 ${from}: ${text || "[image]"}`);
 
-  // Accusé de réception immédiat pour les messages longs à traiter
+  // Réponse immédiate à Twilio
   res.status(200).send('');
 
   try {
@@ -691,14 +578,15 @@ app.post("/webhook", async (req, res) => {
     const history = await getHistory(from);
     const relevantMemory = await getRelevantMemory(text);
 
+    // Injecte données Shopify si pertinent
     let shopifyContext = "";
-    const shopifyKeywords = ["commande", "vente", "produit", "stock", "prix", "revenu", "chiffre", "boutique", "shopify"];
+    const shopifyKeywords = ["commande", "vente", "produit", "stock", "prix", "revenu", "chiffre", "boutique", "shopify", "modifie", "modifier", "change"];
     if (shopifyKeywords.some(k => text.toLowerCase().includes(k))) {
       try {
         const stats = await getShopifyStats();
-        shopifyContext = `\n\n═══════════════════════════════\nDONNÉES SHOPIFY DODODOG EN TEMPS RÉEL\n═══════════════════════════════\nCommandes (30j): ${stats.orders_30j}\nRevenu (30j): ${stats.revenue_30j}€\nProduits actifs: ${stats.products_active} | Archivés: ${stats.products_archived} | Brouillons: ${stats.products_draft}`;
+        shopifyContext = `\n\n═══════════════════════════════\nDONNÉES SHOPIFY DODODOG (TEMPS RÉEL)\n═══════════════════════════════\nCommandes (30j): ${stats.orders_30j} | Revenu: ${stats.revenue_30j}€\nProduits: ${stats.products_active} actifs, ${stats.products_archived} archivés, ${stats.products_draft} brouillons`;
       } catch (err) {
-        console.error("Erreur stats Shopify:", err.message);
+        console.error("Stats Shopify:", err.message);
       }
     }
 
@@ -707,52 +595,53 @@ app.post("/webhook", async (req, res) => {
       shopifyContext;
 
     let reply;
-
     if (numMedia > 0) {
-      await saveMessage(from, "user", `[Image envoyée] ${text}`);
+      await saveMessage(from, "user", `[Image] ${text}`);
       reply = await handleImageMessage(req, history, systemWithMemory);
     } else {
       await saveMessage(from, "user", text);
       history.push({ role: "user", content: text });
       const model = selectModel(text);
       const response = await anthropic.messages.create({
-        model: model,
-        max_tokens: 1024,
-        system: systemWithMemory,
-        messages: history,
+        model, max_tokens: 1024, system: systemWithMemory, messages: history,
       });
       reply = response.content[0].text;
     }
 
     await saveMessage(from, "assistant", reply);
-    detectAndSaveMemory(text, reply).catch(err => console.error("Mémoire auto:", err.message));
-    await sendWhatsApp(from, reply);
+
+    // Détecte et prépare une action Shopify si Claude en a inclus une
+    const actionPreview = await detectAndExecuteAction(reply, from);
+
+    // Nettoie le bloc [ACTION:...] de la réponse avant envoi
+    const cleanReply = reply.replace(/\[ACTION:[^\]]+\]/g, "").trim();
+
+    await sendWhatsApp(from, cleanReply);
+
+    // Mémoire auto (sans bloquer)
+    const manualTrigger = ["retiens", "souviens", "note que", "mémorise"];
+    if (manualTrigger.some(t => text.toLowerCase().includes(t))) {
+      saveMemory(`note_${Date.now()}`, text, "manuel").catch(() => {});
+    }
 
   } catch (err) {
     console.error("Erreur webhook:", err.message);
-    await sendWhatsApp(from, `❌ Erreur : ${err.message}`).catch(() => {});
+    if (err.status !== 429) {
+      await sendWhatsApp(from, `❌ Erreur : ${err.message}`).catch(() => {});
+    }
   }
 });
 
+// Route de test Shopify
 app.get("/test-shopify", async (req, res) => {
   try {
     const token = await getShopifyToken();
-    const count = await axios.get(
-      `https://${SHOPIFY_SHOP}/admin/api/2024-01/products/count.json`,
-      { headers: { "X-Shopify-Access-Token": token } }
-    );
-    const list = await axios.get(
-      `https://${SHOPIFY_SHOP}/admin/api/2024-01/products.json?limit=5`,
-      { headers: { "X-Shopify-Access-Token": token } }
-    );
-    res.json({
-      token: token.slice(0, 10) + "...",
-      shop: SHOPIFY_SHOP,
-      count: count.data,
-      first_5_products: list.data.products?.map(p => ({ id: p.id, title: p.title, status: p.status }))
+    const count = await axios.get(`https://${SHOPIFY_SHOP}/admin/api/2024-01/products/count.json`, {
+      headers: { "X-Shopify-Access-Token": token }
     });
+    res.json({ token: token.slice(0, 10) + "...", shop: SHOPIFY_SHOP, count: count.data });
   } catch (err) {
-    res.json({ error: err.response?.data || err.message, status: err.response?.status });
+    res.json({ error: err.response?.data || err.message });
   }
 });
 
@@ -762,5 +651,5 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   await initDB();
   console.log(`Jarvis démarré sur le port ${PORT}`);
-  console.log(`Pour connecter Shopify: ${APP_URL}/auth`);
+  console.log(`Shopify auth: ${APP_URL}/auth`);
 });
