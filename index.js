@@ -12,6 +12,24 @@ app.use(express.json());
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
+// Appel Claude avec retry automatique sur 429
+async function claudeWithRetry(params, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await anthropic.messages.create(params);
+    } catch (err) {
+      const is429 = err.status === 429 || err.message?.includes("429");
+      if (is429 && attempt < retries) {
+        const waitMs = attempt * 60000; // 60s, 120s, 180s
+        console.log(`⏳ Rate limit 429 — attente ${waitMs/1000}s (tentative ${attempt}/${retries})`);
+        await new Promise(r => setTimeout(r, waitMs));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 // ═══════════════════════════════
 // SÉCURITÉ
 // ═══════════════════════════════
@@ -406,7 +424,7 @@ async function handleImageMessage(req, history, systemWithMemory) {
   if (!mediaType?.startsWith("image/")) return "Je ne peux traiter que des images.";
   const imgResp = await axios.get(mediaUrl, { responseType: "arraybuffer", auth: { username: process.env.TWILIO_SID, password: process.env.TWILIO_TOKEN } });
   const base64Image = Buffer.from(imgResp.data).toString("base64");
-  const response = await anthropic.messages.create({
+  const response = await claudeWithRetry({
     model: MODEL_SONNET, max_tokens: 1024, system: systemWithMemory,
     messages: [...history, { role: "user", content: [
       { type: "image", source: { type: "base64", media_type: mediaType, data: base64Image } },
@@ -584,7 +602,7 @@ ${productList}`;
     } else {
       await saveMessage(from, "user", text);
       history.push({ role: "user", content: text });
-      const response = await anthropic.messages.create({
+      const response = await claudeWithRetry({
         model: selectModel(text), max_tokens: 2048,
         system: systemWithMemory, messages: history,
       });
